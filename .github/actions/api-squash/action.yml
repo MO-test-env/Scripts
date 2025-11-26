@@ -1,0 +1,96 @@
+name: Squash PR
+description: "Squash all commits in a PR into a single commit, preserving author of first commit"
+
+# Inputs the composite action will accept
+inputs:
+  owner:
+    description: 'Organization'
+    required: true
+    type: string
+    default: 'MO-test-env'
+  repo:
+    description: 'Repository'
+    required: true
+    type: string
+  pr_number:
+    description: "PR number to squash"
+    required: true
+    default: 1
+  token:
+    description: "GitHub token"
+    required: true
+
+# Outputs for downstream workflows
+outputs:
+  squash_result:
+    description: "Result of the squash operation (success or skipped)"
+  squash_needed:
+    description: "Whether squash was needed"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Squash PR commits
+      id: squash
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ inputs.token }}
+        script: |
+          const prNumber = parseInt("${{ inputs.pr_number }}");
+          const owner = "${{ inputs.owner }}";
+          const repo = "${{ inputs.repo }}";
+
+          const pr = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
+          const { data: commits } = await github.rest.pulls.listCommits({ owner, repo, pull_number: prNumber });
+
+          if (commits.length <= 1) {
+            core.setOutput("squash_needed", "false");
+            core.setOutput("squash_result", "skipped");
+            core.info("PR has only one commit; skipping squash.");
+            return;
+          }
+
+          core.info(`Found ${commits.length} commits in PR #${prNumber}`);
+
+          const firstCommit = commits[0];
+          const headCommit = commits[commits.length - 1];
+
+          const { data: headCommitData } = await github.rest.git.getCommit({ owner, repo, commit_sha: headCommit.sha });
+          const { data: firstCommitData } = await github.rest.git.getCommit({ owner, repo, commit_sha: firstCommit.sha });
+
+          const parentSha = firstCommitData.parents[0].sha;
+          core.info(`Using first PR commit's parent as squash parent: ${parentSha}`);
+
+          const squashMessage = `${pr.data.title}\n\n${pr.data.body || ''}\n`;
+
+          const author = headCommitData.author;
+          const committer = headCommitData.committer;
+          const signature = headCommitData.verification?.signature || null;
+          const payload = headCommitData.verification?.payload || null;
+
+          core.info(`Preserving original author metadata: ${author.name} <${author.email}>`);
+          // if (signature) core.info(`Preserving original commit signature`);
+
+          let commitOptions = {
+            owner,
+            repo,
+            message: squashMessage,
+            tree: headCommitData.tree.sha,
+            parents: [parentSha],
+            author: { name: author.name, email: author.email, date: author.date }
+          };
+
+          // This works on github.com but the signature cant be verified in enterprise env - still in dev- MO :)
+          // if (signature && payload) {
+          //   commitOptions.signature = signature;
+          //}
+
+          const { data: newCommit } = await github.rest.git.createCommit(commitOptions);
+
+          const branchRef = pr.data.head.ref;
+
+          await github.rest.git.updateRef({ owner, repo, ref: `heads/${branchRef}`, sha: newCommit.sha, force: true });
+
+          core.info(`Squash completed. New commit: ${newCommit.sha}`);
+          core.setOutput("squash_result", "success");
+          core.setOutput("squash_needed", "true");

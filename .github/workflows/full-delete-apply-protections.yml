@@ -1,0 +1,608 @@
+name: Delete and Apply Branch Protections
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        type: boolean
+        description: 'If "true", show what would be done without making requests'
+        required: false
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+env:
+  RW_PAT: ${{ secrets.WORKFLOWS }}
+  ORG: MO-test-env
+  REPO_FILE: repo-config.yml
+  BRANCH_PROTECTION_FILE: default-protection-config.yml
+
+jobs:
+  apply-all:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyyaml
+
+      - name: Run Python Scripts
+        id: run-python
+        run: |
+          echo "Running minimal_yml_to_json.py on repo-config.yml"
+          python minimal_yml_to_json.py ${{ env.REPO_FILE }} > minimal_repo_output.txt
+          cat minimal_repo_output.txt
+          
+          echo "Running minimal_yml_to_json.py on branch-protection-config.yml"
+          python minimal_yml_to_json.py ${{ env.BRANCH_PROTECTION_FILE }} > minimal_protection_output.txt
+          cat minimal_protection_output.txt
+          
+          # Create outputs that can be used in the next step
+          echo "minimal_repo=$(cat minimal_repo_output.txt | base64 -w 0)" >> $GITHUB_OUTPUT
+          echo "minimal_protection=$(cat minimal_protection_output.txt | base64 -w 0)" >> $GITHUB_OUTPUT
+
+      - name: Parse Repo yml into JSON
+        id: parse-yml
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ env.RW_PAT }}
+          script: |
+            const org = process.env.ORG;
+            // Access the outputs from the Python scripts
+            const minimalRepoOutput = Buffer.from('${{ steps.run-python.outputs.minimal_repo }}', 'base64').toString();
+            const minimalProtectionOutput = Buffer.from('${{ steps.run-python.outputs.minimal_protection }}', 'base64').toString();
+            
+            // Log the Python outputs for debugging
+            core.info('Python script outputs:');
+            core.info(`Minimal YAML Parser - Repo Config:\n${minimalRepoOutput}`);
+            core.info(`Minimal YAML Parser - Protection Config:\n${minimalProtectionOutput}`);
+            
+            // Parse the JSON outputs
+            const repoConfig = JSON.parse(minimalRepoOutput);
+            const protectionConfig = JSON.parse(minimalProtectionOutput);
+
+            // Process repositories to create branch protections by repo
+            const branchProtectionsByRepo = {};
+            
+            if (repoConfig && repoConfig.repositories) {
+              for (const repo of repoConfig.repositories) {
+                // Extract the repository name from the first key in the repo object
+                const repoName = Object.keys(repo).find(key => key !== 'default' && key !== 'locked');
+                
+                if (!repoName) {
+                  core.warning('Found repository entry without a valid name, skipping');
+                  continue;
+                }
+                
+                // Get the repository data - either from the repo[repoName] or directly from repo
+                const repoData = {
+                  default: repo.default || [],
+                  locked: repo.locked || []
+                };
+                
+                let apiDefaultBranch = null;
+                try {
+                  const { data: repoInfo } = await github.rest.repos.get({
+                    owner: org,
+                    repo: repoName,
+                  });
+                  apiDefaultBranch = repoInfo.default_branch;
+                  core.info(`API default branch for ${repoName}: ${apiDefaultBranch}`);
+                } catch (error) {
+                  core.warning(`Failed to get repo info for ${repoName}: ${error.message}`);
+                  continue;
+                }
+                
+                // Get default and locked branches from config or use defaults
+                branchProtectionsByRepo[repoName] = {
+                  default: repoData.default.length > 0 ? repoData.default : [],
+                  locked: repoData.locked.length > 0 ? repoData.locked : []
+                };
+
+                // Use only api call if no branches are specified
+                if (branchProtectionsByRepo[repoName].default.length === 0 && 
+                    branchProtectionsByRepo[repoName].locked.length === 0 && 
+                    apiDefaultBranch) {
+                  const otherBranch = apiDefaultBranch === 'main' ? 'master' : 'main';
+                  branchProtectionsByRepo[repoName].default = [apiDefaultBranch];
+                  branchProtectionsByRepo[repoName].locked = [otherBranch];
+                }
+
+                if (apiDefaultBranch && !(branchProtectionsByRepo[repoName].default.includes(apiDefaultBranch))) {
+                  core.warning(`Default branch ${apiDefaultBranch} is not in the list of default branches for ${repoName}!`);
+                }
+              }
+            } else {
+              core.error('Invalid or empty repository configuration');
+            }
+
+            // Extract protection configurations
+            const defaultProtectionConfig = protectionConfig && protectionConfig.branch_protection ? protectionConfig.branch_protection : {};
+            const lockedProtectionConfig = protectionConfig && protectionConfig.lock_branch_protection ? protectionConfig.lock_branch_protection : {};
+            
+            // Set outputs for next steps
+            core.setOutput("branch-protections_by_repo", JSON.stringify(branchProtectionsByRepo));
+            core.setOutput("default_protection_config", JSON.stringify(defaultProtectionConfig));
+            core.setOutput("locked_protection_config", JSON.stringify(lockedProtectionConfig));
+
+      - name: Apply 
+        id: apply
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ env.RW_PAT }}
+          script: |
+            const org = process.env.ORG;
+            const dryRun = '${{ github.event.inputs.dry_run }}' === 'true';
+            const repos = JSON.parse('${{ steps.parse-yml.outputs.branch-protections_by_repo }}');
+            const defaultConfig = JSON.parse('${{ steps.parse-yml.outputs.default_protection_config }}');
+            const lockedConfig = JSON.parse('${{ steps.parse-yml.outputs.locked_protection_config }}');
+            
+            // Helper function to delete all existing branch protections for a repo 
+            const deleteBranchProtections = async (repo) => {
+              try {
+                core.info(`Deleting branch protections for ${org}/${repo}`);
+                // Query for repository ID and all branch protection rules directly
+                const repoQuery = `
+                  query($owner: String!, $name: String!) {
+                    repository(owner: $owner, name: $name) {
+                      id
+                      branchProtectionRules(first: 100) {
+                        nodes {
+                          id
+                          pattern
+                        }
+                      }
+                    }
+                  }
+                `;
+                
+                const repoResult = await github.graphql(repoQuery, {
+                  owner: org,
+                  name: repo
+                });
+                
+                if (!repoResult.repository) {
+                  throw new Error(`Repository ${org}/${repo} not found`);
+                }
+                
+                const protectionRules = repoResult.repository.branchProtectionRules.nodes;
+                core.info(`Found ${protectionRules.length} branch protection rules in ${org}/${repo}`);
+                
+                // Delete each protection rule
+                for (const rule of protectionRules) {
+                  if (dryRun) {
+                    core.info(`[DRY RUN] Would delete branch protection rule with pattern: ${rule.pattern} (ID: ${rule.id})`);
+                    return;
+                  } else {
+                    core.info(`Deleting branch protection rule with pattern: ${rule.pattern} (ID: ${rule.id})`);
+                    
+                    const deleteMutation = `
+                      mutation($ruleId: ID!) {
+                        deleteBranchProtectionRule(input: {branchProtectionRuleId: $ruleId}) {
+                          clientMutationId
+                        }
+                      }
+                    `;
+                    
+                    await github.graphql(deleteMutation, {
+                      ruleId: rule.id
+                    });
+                    
+                    core.info(`⛔ Successfully deleted branch protection rule with pattern: ${rule.pattern}`);
+                  }
+                }
+                
+                core.info(`All branch protection rules have been deleted for ${org}/${repo}`);
+              } catch (e) {
+                core.error(`❌ Failed to delete branch protections for ${org}/${repo}: ${e.message}`);
+              }
+            };
+
+            // Helper function to apply protection to a branch using GraphQL
+            const applyBranchProtection = async (repo, branch, protectionType, config) => {
+
+              try {
+                core.info(`Applying ${protectionType} protection to ${org}/${repo}@${branch}`);
+                if(dryRun){
+                  core.info(`[DRY RUN] Would APPLY ${protectionType} protection to ${org}/${repo}@${branch}`);
+                  return;
+                }
+                
+                // Get repository ID using GraphQL
+                const repoQuery = `
+                  query($owner: String!, $name: String!) {
+                    repository(owner: $owner, name: $name) {
+                      id
+                      branchProtectionRules(first: 100) {
+                        nodes {
+                          id
+                          pattern
+                        }
+                      }
+                    }
+                  }
+                `;
+                
+                const repoResult = await github.graphql(repoQuery, {
+                  owner: org,
+                  name: repo
+                });
+                
+                if (!repoResult.repository) {
+                  throw new Error(`Repository ${org}/${repo} not found`);
+                }
+                
+                const repositoryId = repoResult.repository.id;
+                const existingRules = repoResult.repository.branchProtectionRules.nodes;
+                
+                // Check if a rule with this pattern already exists
+                const existingRule = existingRules.find(rule => rule.pattern === branch);
+                
+                // Delete existing rule if it exists
+                if (existingRule) {
+                  const deleteMutation = `
+                    mutation($ruleId: ID!) {
+                      deleteBranchProtectionRule(input: {branchProtectionRuleId: $ruleId}) {
+                        clientMutationId
+                      }
+                    }
+                  `;
+                  
+                  await github.graphql(deleteMutation, {
+                    ruleId: existingRule.id
+                  });
+                }
+                
+                // Convert REST API config to GraphQL format
+                const graphqlConfig = {
+                  requiresApprovingReviews: config.required_pull_request_reviews ? true : false,
+                  requiredApprovingReviewCount: config.required_pull_request_reviews?.required_approving_review_count || 0,
+                  dismissesStaleReviews: config.required_pull_request_reviews?.dismiss_stale_reviews || false,
+                  requiresCodeOwnerReviews: config.required_pull_request_reviews?.require_code_owner_reviews || false,
+                  requiresCommitSignatures: config.required_signatures || false,
+                  isAdminEnforced: config.enforce_admins || false,
+                  requiresLinearHistory: config.required_linear_history || false,
+                  allowsForcePushes: config.allow_force_pushes || false,
+                  allowsDeletions: config.allow_deletions || false,
+                  blocksCreations: config.block_creations || false,
+                  requiresConversationResolution: config.required_conversation_resolution || false,
+                  lockBranch: config.lock_branch || false,
+                };
+                
+                // Add restriction settings if present
+                if (config.restrictions) {
+                  // Convert team names to team IDs
+                  const teamIds = [];
+                  if (config.restrictions.teams && config.restrictions.teams.length > 0) {
+                    for (const teamSlug of config.restrictions.teams) {
+                      try {
+                        const teamQuery = `
+                          query($org: String!, $teamSlug: String!) {
+                            organization(login: $org) {
+                              team(slug: $teamSlug) {
+                                id
+                              }
+                            }
+                          }
+                        `;
+                        
+                        const teamResult = await github.graphql(teamQuery, {
+                          org: org,
+                          teamSlug: teamSlug
+                        });
+                        
+                        if (teamResult.organization?.team?.id) {
+                          teamIds.push(teamResult.organization.team.id);
+                        }
+                      } catch (error) {
+                        core.warning(`Could not find team ID for ${teamSlug}: ${error.message}`);
+                      }
+                    }
+                  }
+                  
+                  // Add user and team restrictions
+                  if (teamIds.length > 0 || (config.restrictions.users && config.restrictions.users.length > 0)) {
+                    graphqlConfig.restrictsPushes = true;
+                    if (teamIds.length > 0) {
+                      graphqlConfig.pushActorIds = teamIds;
+                    }
+                    if (config.restrictions.users && config.restrictions.users.length > 0) {
+                      // If pushActorIds doesn't exist yet, initialize it
+                      if (!graphqlConfig.pushActorIds) {
+                        graphqlConfig.pushActorIds = [];
+                      }
+                      
+                      // Add user IDs to the push actors list
+                      for (const username of config.restrictions.users) {
+                        try {
+                          const userQuery = `
+                            query($username: String!) {
+                              user(login: $username) {
+                                id
+                              }
+                            }
+                          `;
+                          
+                          const userResult = await github.graphql(userQuery, {
+                            username: username
+                          });
+                          
+                          if (userResult.user?.id) {
+                            graphqlConfig.pushActorIds.push(userResult.user.id);
+                          }
+                        } catch (error) {
+                          core.warning(`Could not find user ID for ${username}: ${error.message}`);
+                        }
+                      }
+                      
+                    }
+                  }
+                }
+                
+                // Process bypass pull request actors if present
+                if (config.required_pull_request_reviews.bypass_pull_request_allowances) {
+                  const bypassActorIds = [];
+                  
+                  // Process bypass teams
+                  if (config.required_pull_request_reviews.bypass_pull_request_allowances.teams && config.required_pull_request_reviews.bypass_pull_request_allowances.teams.length > 0) {
+                    for (const teamSlug of config.required_pull_request_reviews.bypass_pull_request_allowances.teams) {
+                      try {
+                        const teamQuery = `
+                          query($org: String!, $teamSlug: String!) {
+                            organization(login: $org) {
+                              team(slug: $teamSlug) {
+                                id
+                              }
+                            }
+                          }
+                        `;
+                        
+                        const teamResult = await github.graphql(teamQuery, {
+                          org: org,
+                          teamSlug: teamSlug
+                        });
+                        
+                        if (teamResult.organization?.team?.id) {
+                          bypassActorIds.push(teamResult.organization.team.id);
+                        }
+                      } catch (error) {
+                        core.warning(`Could not find team ID for ${teamSlug}: ${error.message}`);
+                      }
+                    }
+                  }
+                  
+                  // Process bypass users
+                  if (config.required_pull_request_reviews.bypass_pull_request_allowances.users && config.required_pull_request_reviews.bypass_pull_request_allowances.users.length > 0) {
+                    for (const username of config.required_pull_request_reviews.bypass_pull_request_allowances.users) {
+                      try {
+                        const userQuery = `
+                          query($username: String!) {
+                            user(login: $username) {
+                              id
+                            }
+                          }
+                        `;
+                        
+                        const userResult = await github.graphql(userQuery, {
+                          username: username
+                        });
+                        
+                        if (userResult.user?.id) {
+                          bypassActorIds.push(userResult.user.id);
+                        }
+                      } catch (error) {
+                        core.warning(`Could not find user ID for ${username}: ${error.message}`);
+                      }
+                    }
+                  }
+                  
+                  if (bypassActorIds.length > 0) {
+                    graphqlConfig.bypassPullRequestActorIds = bypassActorIds;
+                  }
+                }
+                
+                // Create branch protection rule using GraphQL
+                const createMutation = `
+                  mutation(
+                  $repositoryId: ID!, 
+                  $pattern: String!, 
+                  $requiresApprovingReviews: Boolean!, 
+                  $requiredApprovingReviewCount: Int, 
+                  $dismissesStaleReviews: Boolean, 
+                  $requiresCodeOwnerReviews: Boolean,
+                  $bypassPullRequestActorIds: [ID!], 
+                  $requiresCommitSignatures: Boolean, 
+                  $isAdminEnforced: Boolean, 
+                  $requiresLinearHistory: Boolean, 
+                  $allowsForcePushes: Boolean, 
+                  $allowsDeletions: Boolean, 
+                  $blocksCreations: Boolean, 
+                  $requiresConversationResolution: Boolean, 
+                  $lockBranch: Boolean, 
+                  $restrictsPushes: Boolean, 
+                  $pushActorIds: [ID!]
+                  ) {
+                    createBranchProtectionRule(input: {
+                      repositoryId: $repositoryId,
+                      pattern: $pattern,
+                      requiresApprovingReviews: $requiresApprovingReviews,
+                      requiredApprovingReviewCount: $requiredApprovingReviewCount,
+                      dismissesStaleReviews: $dismissesStaleReviews,
+                      requiresCodeOwnerReviews: $requiresCodeOwnerReviews,
+                      bypassPullRequestActorIds: $bypassPullRequestActorIds,
+                      requiresCommitSignatures: $requiresCommitSignatures,
+                      isAdminEnforced: $isAdminEnforced,
+                      requiresLinearHistory: $requiresLinearHistory,
+                      allowsForcePushes: $allowsForcePushes,
+                      allowsDeletions: $allowsDeletions,
+                      blocksCreations: $blocksCreations,
+                      requiresConversationResolution: $requiresConversationResolution,
+                      lockBranch: $lockBranch,
+                      restrictsPushes: $restrictsPushes,
+                      pushActorIds: $pushActorIds
+                    }) {
+                      branchProtectionRule {
+                        id
+                        pattern
+                      }
+                    }
+                  }
+                `;
+                
+                // Create the branch protection rule
+                await github.graphql(createMutation, {
+                  repositoryId,
+                  pattern: branch,
+                  ...graphqlConfig,
+                });
+                
+                core.info(`✅ Created branch protection rule for ${repo}@${branch} (even if branch doesn't exist)`);
+              } catch (e) {
+                core.error(`❌ Failed: ${repo}@${branch}: ${e.message}`);
+              }
+            };
+            
+            // Helper function to delete all existing rulesets 
+            const deleteAllRulesets = async (repo) =>{
+              try {
+                const { data: existingRulesets } = await github.rest.repos.getRepoRulesets({
+                  owner: org,
+                  repo: repo
+                });
+                
+                if (existingRulesets && existingRulesets.length > 0) {
+                  core.info(`Found ${existingRulesets.length} existing rulesets for ${org}/${repo}:`);
+                  for (const ruleset of existingRulesets) {
+                    // core.info(`- Ruleset: ${ruleset.name} (ID: ${ruleset.id})`);
+                    // core.info(`  Target: ${ruleset.target}, Enforcement: ${ruleset.enforcement}`);
+                    if(dryRun){
+                      core.info(`[DRY RUN] Would delete ruleset ${ruleset.name} (ID: ${ruleset.id})`);
+                      return;
+                    }
+                    else {
+                    // Delete all existing rulesets
+                    await github.rest.repos.deleteRepoRuleset({
+                      owner: org,
+                      repo: repo,
+                      ruleset_id: ruleset.id
+                      });
+                    }
+                    
+                  }
+                } else {
+                  core.info(`No existing rulesets found for ${org}/${repo}\n`);
+                }
+              } catch (error) {
+                core.warning(`Error reading existing rulesets for ${org}/${repo}: ${error.message}`);
+              }
+            }
+
+            // Helper function to apply signature verification as a repository ruleset
+            const applySignatureVerificationRuleset = async (repo) => {
+              if(dryRun){
+                core.info(`[DRY RUN] Would create and apply signature verification ruleset to ${org}/${repo}`);
+                return;
+              }
+              try {
+                core.info(`Applying signature verification ruleset to ${org}/${repo}`);
+                
+                // Check for existing rulesets with the same name
+                const rulesetName = "Signature Verification Ruleset";
+                try {
+                  core.info(`Checking for existing rulesets named "${rulesetName}" in ${org}/${repo}`);
+                  const { data: existingRulesets } = await github.rest.repos.getRepoRulesets({
+                    owner: org,
+                    repo: repo
+                  });
+                  
+                  // Find ruleset with matching name
+                  const existingRuleset = existingRulesets.find(ruleset => ruleset.name === rulesetName);
+                  
+                  if (existingRuleset) {
+                    core.info(`Found existing ruleset "${rulesetName}" with ID ${existingRuleset.id}. Deleting it...`);
+                    
+                    // Delete the existing ruleset
+                    await github.rest.repos.deleteRepoRuleset({
+                      owner: org,
+                      repo: repo,
+                      ruleset_id: existingRuleset.id
+                    });
+                    
+                    core.info(`Successfully deleted existing ruleset "${rulesetName}"`);
+                  } else {
+                    core.info(`No existing ruleset named "${rulesetName}" found in ${org}/${repo}`);
+                  }
+                } catch (error) {
+                  core.warning(`Error checking/deleting existing rulesets: ${error.message}`);
+                }
+                
+                // Create the ruleset payload
+                const rulesetPayload = {
+                  name: rulesetName,
+                  target: "branch",
+                  enforcement: "active",
+                  bypass_actors: [{
+                      actor_id: 1,
+                      actor_type: "OrganizationAdmin",
+                      bypass_mode: "always"
+                    }],
+                  conditions: {
+                    ref_name: {
+                      include: ["~ALL"],
+                      exclude: []
+                    }
+                  },
+                  rules: [
+                    {
+                      type: "required_signatures"
+                    }
+                  ]
+                };
+                
+                // Create the repository ruleset using REST API
+                const { data: ruleset } = await github.rest.repos.createRepoRuleset({
+                  owner: org,
+                  repo: repo,
+                  ...rulesetPayload
+                });
+                
+                core.info(`🔏 Created signature verification ruleset for ${repo}`);
+              } catch (e) {
+                core.error(`❌ Failed to apply signature verification ruleset to ${repo}: ${e.message}`);
+              }
+            };
+
+            // Primary logic to use the above functions
+            for (const [repo, branches] of Object.entries(repos)) {
+              core.info(`\n****** Processing ${org}/${repo}`);
+              //Handle Rulesets
+              await deleteAllRulesets(repo);
+
+              // Currently commented out unless TechOps requires in future
+              // Apply signature verification as a repository ruleset
+              // await applySignatureVerificationRuleset(repo);
+              
+              // Delete all existing branch protections 
+              await deleteBranchProtections(repo);
+
+              // Apply to default branches
+              for (const branch of branches.default || []) {
+                await applyBranchProtection(repo, branch, 'DEFAULT', defaultConfig);
+              }
+              
+              // Apply to locked branches
+              for (const branch of branches.locked || []) {
+                await applyBranchProtection(repo, branch, 'LOCKED', lockedConfig);
+              }
+            }
+

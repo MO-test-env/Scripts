@@ -1,0 +1,117 @@
+name: GitHub API Test (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      owner:
+        description: "Owner of the repo"
+        required: true
+        type: string
+        default: "CSG-Firmware-Engineering"
+      repo:
+        description: "Repo name"
+        required: true
+        type: string
+        default: "orgBase"
+      pr_number:
+        description: "PR Number"
+        required: true
+        type: number
+        default: 78
+
+permissions:
+  issues: write
+  pull-requests: write
+  contents: write
+
+env:
+  RW_PAT: ${{ secrets.CSG_TECHOPS_GITHUB_TOKEN_RW }}
+
+jobs:
+  fetch:
+    runs-on: isg-ocp-x86-small
+    timeout-minutes: 3
+    steps:
+      # - name: Import GPG key
+      #   shell: bash
+      #   run: |
+      #     echo "${{ secrets.SA_GPG_PRIVATE_KEY }}" | gpg --batch --import
+      
+      # - name: Trust imported GPG key
+      #   run: |
+      #     # echo -e "5\ny\n" | gpg --command-fd 0 --expert --edit-key "${{ secrets.SA_GPG_KEY_ID }}" trust
+      #     echo -e "5\ny\n" | gpg --batch --yes --no-tty --command-fd 0 --expert --edit-key "${{ secrets.SA_GPG_KEY_ID }}" trust
+      
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          
+      # - name: Checkout utils repository
+      #   uses: actions/checkout@v4
+      #   with:
+      #     repository: CSG-Firmware-Engineering/CDC_Ags_Scripts
+      #     path: CDC_Ags_Scripts
+      #     sparse-checkout: scripts/pr-utils.js
+      #     sparse-checkout-cone-mode: false
+          
+      - name: Squash 
+        id: squash
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ env.RW_PAT }}
+          script: |
+            const prNumber = parseInt("${{ inputs.pr_number }}");
+            const owner = "${{ inputs.owner }}";
+            const repo = "${{ inputs.repo }}";
+            
+            // Import the pr-utils.js module
+            const fs = require('fs');
+            const path = require('path');
+            const prUtils = require('./scripts/pr-utils.js');
+            
+            // Call the apiSquashPR function
+            const result = await prUtils.apiSquashPR(github, core, owner, repo, prNumber);
+            
+            // Set outputs based on the result
+            if (!result.squashNeeded) {
+              core.setOutput("squash_needed", "false");
+            } else {
+              core.setOutput("squash_needed", "true");
+              core.setOutput("squash_result", result.result);
+              if (result.sha) {
+                core.setOutput("squash_sha", result.sha);
+              }
+            }
+            
+      - name: Rebase
+        id: rebase
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ env.RW_PAT }}
+          script: |
+            const prNumber = parseInt("${{ inputs.pr_number }}");
+            const owner = "${{ inputs.owner }}";
+            const repo = "${{ inputs.repo }}";
+            
+            // Import the pr-utils.js module
+            const fs = require('fs');
+            const path = require('path');
+            const prUtils = require('./scripts/pr-utils.js');
+            
+            // Call the apiRebasePR function
+            const result = await prUtils.apiRebasePR(github, core, owner, repo, prNumber);
+            
+            // Set outputs based on the result
+            if (!result.rebaseNeeded) {
+              core.setOutput("rebase_needed", "false");
+            } else {
+              core.setOutput("rebase_needed", "true");
+              core.setOutput("rebase_result", result.result);
+              if (result.sha) {
+                core.setOutput("rebase_sha", result.sha);
+              }
+              if (result.error) {
+                core.setOutput("rebase_error", result.error);
+              }
+            }
