@@ -104,10 +104,10 @@ async function apiRebasePR(github, core, owner, repo, prNumber) {
 
     // identical = nothing to rebase
     // ahead | behind | diverged = rebase needed
-    if (comparison.data.status === "identical") {
-      core.info(`PR is identical to ${baseBranch}; skipping rebase.`);
-      return { rebaseNeeded: false, result: "skipped" };
-    }
+    //if (comparison.data.status === "identical") {
+    //  core.info(`PR is identical to ${baseBranch}; skipping rebase.`);
+    //  return { rebaseNeeded: false, result: "skipped" };
+    //}
 
     core.info(`Rebase needed (status = ${comparison.data.status}).`);
 
