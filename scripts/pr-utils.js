@@ -68,9 +68,8 @@ async function apiSquashPR(github, core, owner, repo, prNumber) {
 }
 
 /**
- * Rebases a PR branch onto its base branch using GitHub API.
- * Note: GitHub API cannot run "git rebase"; I manually replay commits.
- * * @param {object} github - The GitHub API client
+ * Rebases a PR branch on top of its target branch using GitHub API
+ * @param {object} github - The GitHub API client
  * @param {object} core - The GitHub Actions core module
  * @param {string} owner - The organization name
  * @param {string} repo - The repository name
@@ -84,9 +83,18 @@ async function apiRebasePR(github, core, owner, repo, prNumber) {
     const prBranch = pr.data.head.ref;
     const baseBranch = pr.data.base.ref;
 
-    core.info(`PR #${prNumber}: ${prBranch} -> ${baseBranch}`);
+    core.info(`PR #${prNumber} branch: ${prBranch}`);
+    core.info(`Target branch: ${baseBranch}`);
 
-    // Compare base ← PR 
+    // Get all commits in PR branch
+    const { data: prCommits } = await github.rest.pulls.listCommits({ owner, repo, pull_number: prNumber });
+
+    if (prCommits.length === 0) {
+      core.info("PR has no commits; skipping rebase.");
+      return { rebaseNeeded: false, result: "skipped" };
+    }
+
+    // Use compareCommits to check if rebase is needed
     const comparison = await github.rest.repos.compareCommits({
       owner,
       repo,
@@ -94,70 +102,58 @@ async function apiRebasePR(github, core, owner, repo, prNumber) {
       head: prBranch
     });
 
-    if (comparison.data.status !== "behind") {
-      core.info("PR does not need rebase (not behind base).");
+    if (comparison.data.status === "identical" || comparison.data.status === "behind") {
+      core.info(`PR branch is already up-to-date with ${baseBranch}; skipping rebase.`);
       return { rebaseNeeded: false, result: "skipped" };
     }
 
-    core.info(`Rebase required: PR is behind by ${comparison.data.behind_by} commits.`);
+    core.info(`PR branch needs rebasing (status: ${comparison.data.status}).`);
 
-    // We want ONLY the commits that are unique to the PR
-    const prUniqueCommits = comparison.data.commits;
-
-    if (prUniqueCommits.length === 0) {
-      core.info("PR contains no unique commits.");
-      return { rebaseNeeded: false, result: "skipped" };
-    }
-
-    // Get latest base branch SHA
-    const { data: baseRef } = await github.rest.git.getRef({
-      owner,
-      repo,
-      ref: `heads/${baseBranch}`
-    });
-
+    // Get latest commit SHA of the target branch
+    const { data: baseRef } = await github.rest.git.getRef({ owner, repo, ref: `heads/${baseBranch}` });
     let parentSha = baseRef.object.sha;
-    let newTopSha = parentSha;
+    let newCommitSha;
 
-    core.info(`Replaying ${prUniqueCommits.length} commits…`);
+    for (const commit of prCommits) {
+      // Get commit tree
+      const { data: commitData } = await github.rest.git.getCommit({ owner, repo, commit_sha: commit.sha });
 
-    for (const commit of prUniqueCommits) {
-      // Get original commit info
-      const oldCommit = await github.rest.git.getCommit({
+      // Create a new commit on top of the current parent
+      const { data: newCommit } = await github.rest.git.createCommit({
         owner,
         repo,
-        commit_sha: commit.sha
-      });
-
-      // Create new commit with same message/tree but new parent
-      const newCommit = await github.rest.git.createCommit({
-        owner,
-        repo,
-        message: oldCommit.data.message,
-        tree: oldCommit.data.tree.sha,
+        message: commit.commit.message,
+        tree: commitData.tree.sha,
         parents: [parentSha],
-        author: oldCommit.data.author,
-        committer: oldCommit.data.committer
+        author: {
+          name: commit.commit.author.name,
+          email: commit.commit.author.email,
+          date: commit.commit.author.date
+        },
+        committer: {
+          name: commit.commit.committer.name,
+          email: commit.commit.committer.email,
+          date: commit.commit.committer.date
+        }
       });
 
-      parentSha = newCommit.data.sha;
-      newTopSha = newCommit.data.sha;
+      parentSha = newCommit.sha;
+      newCommitSha = newCommit.sha;
     }
 
-    // Force-update PR branch to new top commit
+    // Update PR branch ref to point to the new top commit
     await github.rest.git.updateRef({
       owner,
       repo,
       ref: `heads/${prBranch}`,
-      sha: newTopSha,
+      sha: newCommitSha,
       force: true
     });
 
-    core.info(`Rebase complete. New PR head: ${newTopSha}`);
-    return { rebaseNeeded: true, result: "success", sha: newTopSha };
-
+    core.info(`Rebase completed. PR branch ${prBranch} is now based on ${baseBranch}`);
+    return { rebaseNeeded: true, result: "success", sha: newCommitSha };
   } catch (error) {
-    core.error(`Rebase failed: ${error.message}`);
+    core.error(`Error rebasing PR: ${error.message}`);
     return { rebaseNeeded: true, result: "failed", error: error.message };
   }
 }
