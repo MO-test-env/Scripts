@@ -32,7 +32,12 @@ async function apiSquashPR(github, core, owner, repo, prNumber) {
     const squashMessage = `${pr.data.title}\n\n${pr.data.body || ''}\n`;
 
     const author = headCommitData.author;
+    const committer = headCommitData.committer;
+    const signature = headCommitData.verification?.signature || null;
+    const payload = headCommitData.verification?.payload || null;
+
     core.info(`Preserving original author metadata: ${author.name} <${author.email}>`);
+    // if (signature) core.info(`Preserving original commit signature`);
 
     let commitOptions = {
       owner,
@@ -42,6 +47,11 @@ async function apiSquashPR(github, core, owner, repo, prNumber) {
       parents: [parentSha],
       author: { name: author.name, email: author.email, date: author.date }
     };
+
+    // This works on github.com but the signature cant be verified in enterprise env - still in dev- MO :)
+    // if (signature && payload) {
+    //   commitOptions.signature = signature;
+    //}
 
     const { data: newCommit } = await github.rest.git.createCommit(commitOptions);
 
