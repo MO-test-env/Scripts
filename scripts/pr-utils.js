@@ -32,10 +32,6 @@ async function apiSquashPR(github, core, owner, repo, prNumber) {
     const squashMessage = `${pr.data.title}\n\n${pr.data.body || ''}\n`;
 
     const author = headCommitData.author;
-    const committer = headCommitData.committer;
-    const signature = headCommitData.verification?.signature || null;
-    const payload = headCommitData.verification?.payload || null;
-
     core.info(`Preserving original author metadata: ${author.name} <${author.email}>`);
     // if (signature) core.info(`Preserving original commit signature`);
 
@@ -47,11 +43,6 @@ async function apiSquashPR(github, core, owner, repo, prNumber) {
       parents: [parentSha],
       author: { name: author.name, email: author.email, date: author.date }
     };
-
-    // This works on github.com but the signature cant be verified in enterprise env - still in dev- MO :)
-    // if (signature && payload) {
-    //   commitOptions.signature = signature;
-    //}
 
     const { data: newCommit } = await github.rest.git.createCommit(commitOptions);
 
@@ -66,139 +57,6 @@ async function apiSquashPR(github, core, owner, repo, prNumber) {
     throw error;
   }
 }
-/**
- * Simple single-commit rebase mimic for GitHub Actions.
- * 
- * Repeats the PR's single commit on top of the latest base branch.
- */
-async function apiCherryPickToRebasePR(github, core, owner, repo, prNumber) {
-  try {
-    core.info(`Rebasing PR #${prNumber} ...`);
-
-    // Get PR info
-    const pr = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
-    const prBranch = pr.data.head.ref;
-    const baseBranch = pr.data.base.ref;
-
-    // Ensure PR has exactly 1 commit (your assumption)
-    const { data: commits } = await github.rest.pulls.listCommits({ owner, repo, pull_number: prNumber });
-
-    if (commits.length !== 1) {
-      throw new Error(`PR must contain exactly one commit – found ${commits.length}`);
-    }
-
-    const prCommitSha = commits[0].sha;
-
-    // Get details for that commit (contains file list)
-    const { data: commitDetail } = await github.rest.repos.getCommit({ owner, repo, ref: prCommitSha });
-
-    const changedFiles = commitDetail.files;
-    if (!changedFiles || changedFiles.length === 0) {
-      core.info("No file changes in commit; nothing to rebase.");
-      return { rebaseNeeded: false, result: "skipped" };
-    }
-
-    // Get base branch HEAD commit + tree
-    const baseRef = await github.rest.git.getRef({ owner, repo, ref: `heads/${baseBranch}`});
-    const baseSha = baseRef.data.object.sha;
-    const baseCommit = await github.rest.git.getCommit({ owner, repo, commit_sha: baseSha });
-    const baseTreeSha = baseCommit.data.tree.sha;
-    core.info(`Rebasing commit ${prCommitSha} onto ${baseBranch} (${baseSha})`);
-
-    //
-    // Build tree entries from changed files. This is the ENTIRE rebase.
-    // For each changed file, grab the content AS OF the PR commit
-    //
-    const treeUpdates = [];
-
-    for (const file of changedFiles) {
-      if (file.status === "removed") {
-        // Mark file as deleted in the new commit
-        treeUpdates.push({
-          path: file.filename,
-          sha: null,       // null = delete file
-          mode: "100644",
-          type: "blob"
-        });
-        continue;
-      }
-
-      // Fetch file content at the PR commit SHA
-      const fileContent = await github.rest.repos.getContent({ owner, repo, path: file.filename, ref: prCommitSha });
-
-      if (Array.isArray(fileContent.data) || fileContent.data.type !== "file") {
-        throw new Error(`Unexpected file type (not a file): ${file.filename}`);
-      }
-
-      const decodedContent = Buffer.from(
-        fileContent.data.content,
-        fileContent.data.encoding
-      ).toString("utf8");
-
-      // Create a blob for the rebased commit
-      const blob = await github.rest.git.createBlob({
-        owner,
-        repo,
-        content: decodedContent,
-        encoding: "utf-8"
-      });
-
-      treeUpdates.push({
-        path: file.filename,
-        sha: blob.data.sha,
-        mode: "100644",
-        type: "blob"
-      });
-    }
-
-    // Create new tree on top of the base tree
-    const newTree = await github.rest.git.createTree({
-      owner,
-      repo,
-      base_tree: baseTreeSha,
-      tree: treeUpdates
-    });
-
-    // Create a new commit on top of the base branch
-    const newCommit = await github.rest.git.createCommit({
-      owner,
-      repo,
-      message: commits[0].commit.message,
-      tree: newTree.data.sha,
-      parents: [baseSha],
-      author: commits[0].commit.author,
-      committer: commits[0].commit.committer
-    });
-
-    core.info(`New rebased commit created: ${newCommit.data.sha}`);
-
-    // Force-update PR branch to point at the new rebased commit
-    await github.rest.git.updateRef({
-      owner,
-      repo,
-      ref: `heads/${prBranch}`,
-      sha: newCommit.data.sha,
-      force: true
-    });
-
-    core.info(`PR branch ${prBranch} rebased onto ${baseBranch}`);
-
-    return {
-      rebaseNeeded: true,
-      result: "success",
-      sha: newCommit.data.sha
-    };
-
-  } catch (err) {
-    core.error(`Rebase failed: ${err.message}`);
-    return {
-      rebaseNeeded: true,
-      result: "failed",
-      error: err.message
-    };
-  }
-}
-
 
 /**
  * Rebases a PR branch on top of its target branch using GitHub API
@@ -215,82 +73,190 @@ async function apiRebasePR(github, core, owner, repo, prNumber) {
     const pr = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
     const prBranch = pr.data.head.ref;
     const baseBranch = pr.data.base.ref;
-
-    core.info(`PR #${prNumber} branch: ${prBranch}`);
-    core.info(`Target branch: ${baseBranch}`);
+    const prHeadSha = pr.data.head.sha;
     
-    // Get comparison data to determine merge base commit
-    const { data: comparison } = await github.rest.repos.compareCommits({ owner, repo, base: baseBranch, head: prBranch});
-    core.info(`Rebase status check: ${comparison.status}`);
-
-    // Get the merge base commit (common ancestor)
-    const mergeBaseCommitSha = comparison.merge_base_commit.sha;
-    core.info(`Merge base commit: ${mergeBaseCommitSha}`);
-
-    // Get all commits in PR branch
-    const { data: prCommits } = await github.rest.pulls.listCommits({ owner, repo, pull_number: prNumber });
-
-    if (prCommits.length === 0) {
-      core.info("PR has no commits; skipping rebase.");
-      return { rebaseNeeded: false, result: "skipped" };
+    // Get latest base branch commit
+    const { data: baseRef } = await github.rest.git.getRef({
+      owner,
+      repo,
+      ref: `heads/${baseBranch}`
+    });
+    const baseSha = baseRef.object.sha;
+    
+    // Get PR commits
+    const { data: commits } = await github.rest.pulls.listCommits({
+      owner,
+      repo,
+      pull_number: prNumber
+    });
+    
+    // Check if rebase is needed
+    if (commits.length > 0 && commits[0].parents[0].sha === baseSha) {
+      core.info(`PR branch ${prBranch} is already based on latest ${baseBranch} commit (${baseSha})`);
+      return { rebaseNeeded: false, result: "skipped", sha: prHeadSha };
     }
-
-    core.info(`PR branch needs rebasing (status: ${comparison.status}).`);
-
-    // Get latest commit SHA of the target branch
-    const { data: baseRef } = await github.rest.git.getRef({ owner, repo, ref: `heads/${baseBranch}` });
-    let parentSha = baseRef.object.sha;
-    let newCommitSha;
-    core.info(`Base branch ${baseBranch} HEAD is at ${parentSha}`);
-
-    for (const commit of prCommits) {
-      // Get commit tree
-      const { data: commitData } = await github.rest.git.getCommit({ owner, repo, commit_sha: commit.sha });
-
-      // Create a new commit on top of the current parent
-      const { data: newCommit } = await github.rest.git.createCommit({
-        owner,
-        repo,
-        message: commit.commit.message,
-        tree: commitData.tree.sha,
-        parents: [parentSha],
-        author: commit.commit.author,
-        committer: commit.commit.committer
-      });
-
-      // Update our parent pointer to this new commit
-      parentSha = newCommit.sha;
-      newCommitSha = newCommit.sha;
-      
-      core.info(`Created new commit: ${newCommit.sha}`);
-    }
-
-    // If no commits were created, nothing was rebased
-    if ( !newCommitSha) {
-      core.warning("No commits were rebased.");
-      return { rebaseNeeded: false, result: "skipped" };
-    }
-
-    // Update PR branch to point at the new commit chain
-    core.info(`Updating PR branch ${prBranch} to point at new commit ${newCommitSha}`);
+    
+    // Get PR branch tree
+    const { data: headCommit } = await github.rest.git.getCommit({
+      owner,
+      repo,
+      commit_sha: prHeadSha
+    });
+    const prTreeSha = headCommit.tree.sha;
+    
+    // Create a new commit with the PR tree but based on the latest base branch commit
+    const { data: newCommit } = await github.rest.git.createCommit({
+      owner,
+      repo,
+      message: `Rebased ${prBranch} onto ${baseBranch} (${baseSha.substring(0, 7)})`,
+      tree: prTreeSha,
+      parents: [baseSha],
+      author: {
+        name: headCommit.author.name,
+        email: headCommit.author.email,
+        date: new Date().toISOString()
+      }
+    });
+    
+    // Update the PR branch reference to point to the new commit
     await github.rest.git.updateRef({
       owner,
       repo,
       ref: `heads/${prBranch}`,
-      sha: newCommitSha,
+      sha: newCommit.sha,
       force: true
     });
-
-    core.info(`Rebase completed. PR branch ${prBranch} is now based on ${baseBranch}`);
-    return { rebaseNeeded: true, result: "success", sha: newCommitSha };
+    
+    core.info(`Rebase completed. PR branch ${prBranch} is now based on ${baseBranch} (${baseSha.substring(0, 7)})`);
+    return { rebaseNeeded: true, result: "success", sha: newCommit.sha };
   } catch (error) {
     core.error(`Error rebasing PR: ${error.message}`);
     return { rebaseNeeded: true, result: "failed", error: error.message };
   }
 }
 
+/**
+ * Cherry-picks a PR branch onto the updated base branch using GitHub API
+ * @param {object} github - The GitHub API client
+ * @param {object} core - The GitHub Actions core module
+ * @param {string} owner - The organization name
+ * @param {string} repo - The repository name
+ * @param {number} prNumber - The PR number to cherry-pick
+ * @returns {object} - Result object with cherryPickNeeded and result properties
+ */
+async function apiCherryPickPR(github, core, owner, repo, prNumber) {
+  try {
+    // Get PR info
+    const pr = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
+    const prBranch = pr.data.head.ref;
+    const baseBranch = pr.data.base.ref;
+    
+    // Get latest base branch commit
+    const { data: baseRef } = await github.rest.git.getRef({
+      owner,
+      repo,
+      ref: `heads/${baseBranch}`
+    });
+    const baseSha = baseRef.object.sha;
+    
+    // Get PR commits
+    const { data: commits } = await github.rest.pulls.listCommits({
+      owner,
+      repo,
+      pull_number: prNumber
+    });
+    
+    // Check if cherry-pick is needed
+    if (commits.length === 0) {
+      core.info(`PR #${prNumber} has no commits to cherry-pick`);
+      return { cherryPickNeeded: false, result: "skipped" };
+    }
+    
+    // Get the current state of the PR branch
+    const { data: prRef } = await github.rest.git.getRef({
+      owner,
+      repo,
+      ref: `heads/${prBranch}`
+    });
+    const originalPrSha = prRef.object.sha;
+    
+    // Create a temporary branch based on the latest base branch
+    const tempBranch = `temp-cherry-pick-${prNumber}-${Date.now()}`;
+    await github.rest.git.createRef({
+      owner,
+      repo,
+      ref: `refs/heads/${tempBranch}`,
+      sha: baseSha
+    });
+    
+    // Apply each commit from the PR to the temporary branch
+    let currentSha = baseSha;
+    for (const commit of commits) {
+      const { data: commitData } = await github.rest.git.getCommit({
+        owner,
+        repo,
+        commit_sha: commit.sha
+      });
+      
+      // Get the tree for this commit
+      const { data: commitTree } = await github.rest.git.getTree({
+        owner,
+        repo,
+        tree_sha: commitData.tree.sha,
+        recursive: 1
+      });
+      
+      // Create a new commit with the same changes but based on the current SHA
+      const { data: newCommit } = await github.rest.git.createCommit({
+        owner,
+        repo,
+        message: commitData.message,
+        tree: commitData.tree.sha,
+        parents: [currentSha],
+        author: {
+          name: commitData.author.name,
+          email: commitData.author.email,
+          date: commitData.author.date
+        }
+      });
+      
+      currentSha = newCommit.sha;
+      
+      // Update the temporary branch to point to this new commit
+      await github.rest.git.updateRef({
+        owner,
+        repo,
+        ref: `heads/${tempBranch}`,
+        sha: currentSha
+      });
+    }
+    
+    // Now update the PR branch to point to the temporary branch's HEAD
+    await github.rest.git.updateRef({
+      owner,
+      repo,
+      ref: `heads/${prBranch}`,
+      sha: currentSha,
+      force: true
+    });
+    
+    // Delete the temporary branch
+    await github.rest.git.deleteRef({
+      owner,
+      repo,
+      ref: `heads/${tempBranch}`
+    });
+    
+    core.info(`Cherry-pick completed. PR branch ${prBranch} changes have been applied on top of the latest ${baseBranch}`);
+    return { cherryPickNeeded: true, result: "success", sha: currentSha };
+  } catch (error) {
+    core.error(`Error cherry-picking PR: ${error.message}`);
+    return { cherryPickNeeded: true, result: "failed", error: error.message };
+  }
+}
+
 module.exports = {
   apiSquashPR,
-  apiCherryPickToRebasePR,
-  apiRebasePR
+  apiRebasePR,
+  apiCherryPickPR
 };
