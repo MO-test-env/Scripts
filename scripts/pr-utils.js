@@ -102,28 +102,19 @@ async function apiRebasePR(github, core, owner, repo, prNumber) {
       return { rebaseNeeded: false, result: "skipped" };
     }
 
+    core.info(`PR branch needs rebasing (status: ${comparison.data.status}).`);
+
     // Get latest commit SHA of the target branch
     const { data: baseRef } = await github.rest.git.getRef({ owner, repo, ref: `heads/${baseBranch}` });
-    const baseBranchHeadSha = baseRef.object.sha;
-    core.info(`Base branch ${baseBranch} HEAD is at ${baseBranchHeadSha}`);
+    let parentSha = baseRef.object.sha;
+    let newCommitSha;
+    core.info(`Base branch ${baseBranch} HEAD is at ${parentSha}`);
 
-    // Start with the base branch HEAD as our new parent
-    let parentSha = baseBranchHeadSha;
-    let newCommitSha = null;
-    let commitCount = 0;
-
-    // Process each commit in the PR
     for (const commit of prCommits) {
       // Get commit tree
       const { data: commitData } = await github.rest.git.getCommit({ owner, repo, commit_sha: commit.sha });
 
-      // Prevent rebasing merge commits (GitHub API does not support recreating them)
-      if (commitData.parents.length !== 1) {
-        core.warning(`Skipping merge commit ${commit.sha}`);
-        continue;
-      }
-
-      // Create a new commit with original tree but new parent
+      // Create a new commit on top of the current parent
       const { data: newCommit } = await github.rest.git.createCommit({
         owner,
         repo,
@@ -137,7 +128,6 @@ async function apiRebasePR(github, core, owner, repo, prNumber) {
       // Update our parent pointer to this new commit
       parentSha = newCommit.sha;
       newCommitSha = newCommit.sha;
-      commitCount++;
       
       core.info(`Created new commit: ${newCommit.sha}`);
     }
