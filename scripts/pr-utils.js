@@ -88,7 +88,7 @@ async function apiRebasePR(github, core, owner, repo, prNumber) {
     
     // Get comparison data to determine merge base commit
     const { data: comparison } = await github.rest.repos.compareCommits({ owner, repo, base: baseBranch, head: prBranch});
-    core.info(`Rebase status check: ${comparison.data.status}`);
+    core.info(`Rebase status check: ${comparison.status}`);
 
     // Get the merge base commit (common ancestor)
     const mergeBaseCommitSha = comparison.merge_base_commit.sha;
@@ -102,7 +102,7 @@ async function apiRebasePR(github, core, owner, repo, prNumber) {
       return { rebaseNeeded: false, result: "skipped" };
     }
 
-    core.info(`PR branch needs rebasing (status: ${comparison.data.status}).`);
+    core.info(`PR branch needs rebasing (status: ${comparison.status}).`);
 
     // Get latest commit SHA of the target branch
     const { data: baseRef } = await github.rest.git.getRef({ owner, repo, ref: `heads/${baseBranch}` });
