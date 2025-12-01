@@ -133,7 +133,7 @@ async function apiRebasePR(github, core, owner, repo, prNumber) {
     }
 
     // If no commits were created, nothing was rebased
-    if (commitCount === 0 || !newCommitSha) {
+    if ( !newCommitSha) {
       core.warning("No commits were rebased.");
       return { rebaseNeeded: false, result: "skipped" };
     }
