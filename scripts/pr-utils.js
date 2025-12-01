@@ -73,65 +73,129 @@ async function apiRebasePR(github, core, owner, repo, prNumber) {
     const pr = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
     const prBranch = pr.data.head.ref;
     const baseBranch = pr.data.base.ref;
-    const prHeadSha = pr.data.head.sha;
-    
-    // Get latest base branch commit
-    const { data: baseRef } = await github.rest.git.getRef({
-      owner,
-      repo,
-      ref: `heads/${baseBranch}`
-    });
-    const baseSha = baseRef.object.sha;
-    
-    // Get PR commits
-    const { data: commits } = await github.rest.pulls.listCommits({
-      owner,
-      repo,
-      pull_number: prNumber
-    });
-    
-    // Check if rebase is needed
-    if (commits.length > 0 && commits[0].parents[0].sha === baseSha) {
-      core.info(`PR branch ${prBranch} is already based on latest ${baseBranch} commit (${baseSha})`);
-      return { rebaseNeeded: false, result: "skipped", sha: prHeadSha };
+    const { data: commits } = await github.rest.pulls.listCommits({ owner, repo, pull_number: prNumber });
+
+    if (commits.length !== 1) {
+      throw new Error(`PR must contain exactly 1 commit. Found ${commits.length}.`);
     }
-    
-    // Get PR branch tree
-    const { data: headCommit } = await github.rest.git.getCommit({
-      owner,
-      repo,
-      commit_sha: prHeadSha
-    });
-    const prTreeSha = headCommit.tree.sha;
-    
-    // Create a new commit with the PR tree but based on the latest base branch commit
+
+    const prCommitSha = commits[0].sha;
+    const { data: prCommitDetail } = await github.rest.repos.getCommit({ owner, repo, ref: prCommitSha });
+    const changedFiles = prCommitDetail.files;
+    if (!changedFiles || changedFiles.length === 0) {
+      core.info("No files changed in PR commit, skipping rebase.");
+      return { rebaseNeeded: false, result: "skipped" };
+    }
+
+    // --- Get base branch HEAD + tree ---
+    const { data: baseRef } = await github.rest.git.getRef({ owner, repo, ref: `heads/${baseBranch}` });
+    const baseSha = baseRef.object.sha;
+
+    const { data: baseCommit } = await github.rest.git.getCommit({ owner, repo, commit_sha: baseSha });
+    const baseTreeSha = baseCommit.tree.sha;
+
+    // BUILD TREE UPDATES (Only create blobs for files that differ from main)
+    const treeUpdates = [];
+
+    for (const file of changedFiles) {
+      const filePath = file.filename;
+
+      let prContent = "";
+      let baseContent = "";
+
+      // Get PR version of the file if it exists
+      if (file.status !== "removed") {
+        const prFile = await github.rest.repos.getContent({ owner, repo, path: filePath, ref: prCommitSha });
+
+        if (!Array.isArray(prFile.data) && prFile.data.type === "file") {
+          prContent = Buffer.from(
+            prFile.data.content,
+            prFile.data.encoding
+          ).toString("utf8");
+        }
+      }
+
+      // Get base version of the file if it exists
+      let baseExists = true;
+      try {
+        const baseFile = await github.rest.repos.getContent({ owner, repo, path: filePath, ref: baseBranch });
+
+        if (!Array.isArray(baseFile.data) && baseFile.data.type === "file") {
+          baseContent = Buffer.from(
+            baseFile.data.content,
+            baseFile.data.encoding
+          ).toString("utf8");
+        }
+      } catch (e) {
+        baseExists = false; // file does not exist in base
+      }
+
+      // Determine if the file is truly different
+      const isDifferent =
+        file.status === "removed" ||
+        !baseExists ||
+        prContent !== baseContent;
+
+      if (!isDifferent) {
+        core.info(`Skipping ${filePath}: unchanged relative to ${baseBranch}`);
+        continue; // ignore this file
+      }
+
+      if (file.status === "removed") {
+        // Remove file in the new commit
+        treeUpdates.push({
+          path: filePath,
+          sha: null,
+          mode: "100644",
+          type: "blob"
+        });
+        continue;
+      }
+
+      // Create blob containing PR version of the file
+      const blob = await github.rest.git.createBlob({ owner, repo, content: prContent, encoding: "utf-8" });
+
+      treeUpdates.push({
+        path: filePath,
+        sha: blob.data.sha,
+        mode: "100644",
+        type: "blob"
+      });
+    }
+
+    if (treeUpdates.length === 0) {
+      core.info("Nothing to rebase; PR contains no differences from main.");
+      return { rebaseNeeded: false, result: "skipped-no-changes" };
+    }
+
+    // Create new tree on top of base tree
+    const { data: newTree } = await github.rest.git.createTree({ owner, repo, base_tree: baseTreeSha, tree: treeUpdates });
+
+    // Create new commit
     const { data: newCommit } = await github.rest.git.createCommit({
       owner,
       repo,
-      message: `Rebased ${prBranch} onto ${baseBranch} (${baseSha.substring(0, 7)})`,
-      tree: prTreeSha,
+      message: commits[0].commit.message,
+      tree: newTree.sha,
       parents: [baseSha],
-      author: {
-        name: headCommit.author.name,
-        email: headCommit.author.email,
-        date: new Date().toISOString()
-      }
+      author: commits[0].commit.author,
+      committer: commits[0].commit.committer
     });
-    
-    // Update the PR branch reference to point to the new commit
-    await github.rest.git.updateRef({
-      owner,
-      repo,
-      ref: `heads/${prBranch}`,
-      sha: newCommit.sha,
-      force: true
-    });
-    
-    core.info(`Rebase completed. PR branch ${prBranch} is now based on ${baseBranch} (${baseSha.substring(0, 7)})`);
-    return { rebaseNeeded: true, result: "success", sha: newCommit.sha };
-  } catch (error) {
-    core.error(`Error rebasing PR: ${error.message}`);
-    return { rebaseNeeded: true, result: "failed", error: error.message };
+
+    // Update the PR branch
+    await github.rest.git.updateRef({ owner, repo, ref: `heads/${prBranch}`, sha: newCommit.sha, force: true });
+
+    core.info(`Rebased PR branch ${prBranch} onto ${baseBranch}`);
+
+    return {
+      rebaseNeeded: true,
+      result: "success",
+      sha: newCommit.sha
+    };
+
+  } catch (err) {
+    core.error(`Rebase failed: ${err.message}`);
+    return { rebaseNeeded: true, result: "failed", error: err.message };
   }
 }
 
