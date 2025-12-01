@@ -85,10 +85,13 @@ async function apiRebasePR(github, core, owner, repo, prNumber) {
 
     core.info(`PR #${prNumber} branch: ${prBranch}`);
     core.info(`Target branch: ${baseBranch}`);
-    core.info(`Rebase status check: ${comparison.data.status}`);
+    
+    // Get comparison data to determine merge base commit
+    const { data: comparison } = await github.rest.repos.compareCommits({ owner, repo, base: baseBranch, head: prBranch});
+    core.info(`Rebase status check: ${comparison.status}`);
     
     // Get the merge base commit (common ancestor)
-    const mergeBaseCommitSha = comparison.data.merge_base_commit.sha;
+    const mergeBaseCommitSha = comparison.merge_base_commit.sha;
     core.info(`Merge base commit: ${mergeBaseCommitSha}`);
 
     // Get all commits in PR branch
@@ -110,7 +113,7 @@ async function apiRebasePR(github, core, owner, repo, prNumber) {
     let commitCount = 0;
 
     // Process each commit in the PR
-    for (const commit of allPrCommits) {
+    for (const commit of prCommits) {
       // Get commit tree
       const { data: commitData } = await github.rest.git.getCommit({ owner, repo, commit_sha: commit.sha });
 
