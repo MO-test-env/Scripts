@@ -88,8 +88,8 @@ async function apiRebasePR(github, core, owner, repo, prNumber) {
     
     // Get comparison data to determine merge base commit
     const { data: comparison } = await github.rest.repos.compareCommits({ owner, repo, base: baseBranch, head: prBranch});
-    core.info(`Rebase status check: ${comparison.status}`);
-    
+    core.info(`Rebase status check: ${comparison.data.status}`);
+
     // Get the merge base commit (common ancestor)
     const mergeBaseCommitSha = comparison.merge_base_commit.sha;
     core.info(`Merge base commit: ${mergeBaseCommitSha}`);
