@@ -177,6 +177,12 @@ jobs:
               return;
             }
 
+      - name: Checkout current repository
+        uses: actions/checkout@v4
+        with:
+          path: repo
+          ref: ${{ steps.pr.outputs.head_ref }}
+
       - name: Comment on PR info success 
         uses: actions/github-script@v7
         with:
@@ -776,144 +782,17 @@ jobs:
             git submodule update --init --depth 1 "$submodule"
           done
       
-      # If there are submodule ptr conflicts resolve them here. If an issue arises we do not want this PR left in a partially merged state. 
-
-      # squash all commits and push back up to pr branch 
-      # manual rebase to resolve pointer conflicts 
-      # sign and push up to pr brnach 
+      # THE FOLLOWING IS NOW HANDLED IN MERGE PROCESS DIRECTLY
+      # - If there are submodule ptr conflicts resolve them here. If an issue arises we do not want this PR left in a partially merged state. 
+      # - squash all commits and push back up to pr branch 
+      # - manual rebase to resolve pointer conflicts 
+      # - sign and push up to pr brnach 
       
-      - name: Squash if needed and rebase (with submodule conflict handling)
-        if: ${{ steps.pr.outputs.state == 'open' && steps.diff-submodules.outputs.updated_git_modules != '{}' }}
-        id: squash-rebase
-        uses: actions/github-script@v7
-        env:
-          BASE: ${{ steps.pr.outputs.base_ref }}
-          PR_BRANCH: ${{ steps.pr.outputs.head_ref }}
-          TOKEN: ${{ env.RW_PAT }}
-          GIT_MODULES: ${{ steps.diff-submodules.outputs.updated_git_modules }}
-          PR_TITLE: ${{ steps.pr.outputs.title }}
-        with:
-          script: |
-            const { execSync } = require('child_process');
-
-            // Helper function that pre-sets some parameters for synchronous command execution  
-            const run = (cmd, opts = {}) => {
-              const stdio = opts.stdio ?? 'pipe';
-              const encoding = opts.encoding ?? 'utf8';
-              console.log(`$ ${cmd}`);
-              try {
-                return execSync(cmd, { stdio, encoding }).trim();
-              } catch (err) {
-                // Allow graceful failure/ fall through so that submodule rebase conflicts can be resolved
-                if (!opts.allowFail) throw err;
-                console.warn(`⚠️ Command failed (continuing): ${cmd}`);
-                console.warn(err.stdout || err.message);
-                return '';
-              }
-            };
-
-            const baseRef = process.env.BASE;
-            const headRef = process.env.PR_BRANCH;
-            const prTitle = process.env.PR_TITLE;
-            const gitModules = JSON.parse(process.env.GIT_MODULES);
-            const submodules = Object.values(gitModules).map(m => m.path.trim().replace(/\/$/, ''));
-
-            console.log(`Base: ${baseRef}, Head: ${headRef}`);
-            console.log(`Submodules: ${submodules.join(', ')}`);
-
-            //  Fetch latest base and head 
-            run(`git fetch origin ${baseRef}:refs/remotes/origin/${baseRef}`);
-            run(`git fetch origin ${headRef}:refs/remotes/origin/${headRef}`);
-            run(`git checkout ${headRef}`);
-            run(`git submodule update --init --recursive ${submodules.join(' ')}`);
-
-            //  Squash commits only if more than one 
-            const base = run(`git merge-base HEAD origin/${baseRef}`);
-            const commitCount = parseInt(run(`git rev-list --count ${base}..HEAD`), 10);
-            console.log(`Commit count in PR: ${commitCount}`);
-
-            if (commitCount > 1) {
-              console.log(' Multiple commits detected — performing squash.');
-              const msgs = run(`git log --reverse --pretty=format:"%s%n%b" ${base}..HEAD`);
-              const subject = `${prTitle} - Squash`;
-              run(`git reset --soft ${base}`);
-              run(`git commit -m "${subject}" -m "${msgs.replace(/"/g, '\\"')}"`);
-            } else {
-              console.log(' Only one commit — skipping squash.');
-            }
-
-            //  Rebase onto base branch 
-            console.log(`Starting rebase onto origin/${baseRef} ...`);
-            const rebaseOutput = run(`git rebase origin/${baseRef}`, { allowFail: true });
-
-            // Declare variables for conflict tracking
-            let hadSubConflicts = false;
-            
-            //  Detect and handle conflicts 
-            let conflicted = run(`git diff --name-only --diff-filter=U`, { allowFail: true }).split('\n').filter(Boolean);
-
-            if (conflicted.length > 0) {
-              console.log(`⚠️ Rebase conflicts detected: ${conflicted.join(', ')}`);
-
-              const subConflicts = conflicted.filter(f => submodules.some(s => f === s || f.startsWith(`${s}/`)));
-              const nonSubConflicts = conflicted.filter(f => !submodules.some(s => f === s || f.startsWith(`${s}/`)));
-              
-              // Set flag if we have submodule conflicts
-              hadSubConflicts = subConflicts.length > 0;
-
-              if (nonSubConflicts.length > 0) {
-                core.setFailed(`❌ Rebase conflicts in non-submodule files:\n${nonSubConflicts.join('\n')}`);
-                core.setOutput("failMsg", `Workflow stopped because rebase conflicts in non-submodule files:\n${nonSubConflicts.join('\n')}`);
-                process.exit(1);
-              }
-
-              if (subConflicts.length > 0) {
-                console.log(`Submodule conflicts only — auto-resolving.`);
-                subConflicts.forEach(sub => run(`git add "${sub}"`));
-                run(`git commit --no-edit`); // Already set the commit message with squash above so no need to change
-                run(`git rebase --continue`, { allowFail: true });
-              }
-            } else {
-              console.log(' No rebase conflicts detected.');
-            }
-
-            //  Final validation and push 
-            let rebaseSuccessful = false;
-
-            // Try one more rebase command to ensure that there are no more conflicts and the previous was successful
-            try {
-              const finalRebase = run(`git rebase origin/${baseRef}`, { allowFail: true });
-              if (/up to date/i.test(finalRebase) || /no rebase in progress/i.test(finalRebase)) {
-                console.log(' Branch already up to date — Confirmed no more conflicts.');
-                rebaseSuccessful = true;
-              } else if (finalRebase.includes('error') || finalRebase.includes('conflict')) {
-                core.setFailed('❌ Rebase failed — unresolved conflicts remain.');
-                core.setOutput("failMsg", `Unresolved conflicts remain after rebase.`);
-                process.exit(1);
-              } else {
-                rebaseSuccessful = true;
-              }
-            } catch (err) {
-              core.setFailed('❌ Rebase failed — unresolved conflicts remain.');
-              core.setOutput("failMsg", `Unresolved conflicts remain after rebase.`);
-              process.exit(1);
-            }
-
-            // Only force push if there were submodule conflicts that were resolved successfully
-            if (hadSubConflicts && rebaseSuccessful) {
-              console.log('Pushing changes with --force-with-lease because submodule conflicts were resolved');
-              run(`git push --force-with-lease origin ${headRef}`);
-              console.log(' Rebase and force push completed successfully.');
-            } else {
-              console.log(' No changes pushed to remote.');
-            }
-            
-
       # merge submods 
         ## squash all commits if needed sign and push back up to pr branch 
         ## pre-form commit title and body (including pr link)
         ## sign and commit submodule merge  
-      -
+
       - name: Merge Submodules
         if: ${{ steps.diff-submodules.outputs.updated_git_modules != '{}' && steps.pre-check-submod.outputs.unmerged != '[]' && steps.pre-check-submod.conclusion == 'success' }}
         id: merge-submodules
@@ -923,6 +802,10 @@ jobs:
         with:
           github-token: ${{ env.RW_PAT }}
           script: |
+            const fs = require('fs');
+            const path = require('path');
+            const prUtils = require('../../repo/scripts/pr-utils.js');
+
             const submodules = JSON.parse(process.env.SUBMODULES);
             const mergeResults = [];
             
@@ -964,20 +847,52 @@ jobs:
               while (retryCount < 3){
                 // This should never need to happen more than once, but sometimes api calls fail so looping adds some additional certainty. 
                 try {
-                  const res = await github.rest.pulls.merge({
+                  // Use localGitMergePipeline instead of github.rest.pulls.merge
+                  const prUtils = require('../../repo/scripts/pr-utils.js');
+                  
+                  // Get PR details to get head and base branches
+                  const { data: prDetails } = await github.rest.pulls.get({
                     owner,
                     repo,
-                    pull_number: pr,
-                    merge_method: "squash",
+                    pull_number: pr
                   });
+                  
+                  const headRef = prDetails.head.ref;
+                  const baseRef = prDetails.base.ref;
+                  const remote = 'origin';
+                  
+                  // Call localGitMergePipeline
+                  const result = await prUtils.localGitMergePipeline(
+                    core,
+                    remote,
+                    baseRef,
+                    headRef,
+                    prNumber,
+                    true, // isBase = true since this is the base repository
+                    submodules,
+                    process.env.OWNER,
+                    process.env.REPO
+                    [],
+                    owner,
+                    repo
+                  );
+                  
+                  // Get the SHA of the merged commit
+                  const { data: branchData } = await github.rest.repos.getBranch({
+                    owner,
+                    repo,
+                    branch: baseRef
+                  });
+                  
+                  const mergedSha = branchData.commit.sha;
                   
                   // Save the merged SHA
                   mergeResults.push({
                     name: sub.name,
                     pr: pr,
                     merged: true,
-                    merged_sha: res.data.sha,
-                    message: res.data.message
+                    merged_sha: mergedSha,
+                    message: result
                   });
                   break;
                 } catch (error) {
@@ -1150,101 +1065,6 @@ jobs:
               core.setOutput('updated', 'false');
             }
 
-      # squash rebase again 
-      # This was moved earlier in the workflow to ensure that nothing would get merged if the submodules could not be rebased cleanly. The next two steps should never have to run but they exist so that the rebase will be repeated if another user happens to push up a change within the same few minutes and hopefully prevent race conditions. Simply re-run if race conditions do occur and this backup fails. 
-      - name: Squash all PR commits 
-        if: ${{ steps.pr-2.outputs.mergeable != 'true' }}
-        id: final-squash
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const { execSync } = require('child_process');
-            const run = (cmd, options = {}) => {
-              console.log(`$ ${cmd}`);
-              return execSync(cmd, { stdio: 'pipe', encoding: 'utf8', ...options }).trim();
-            };
-
-            try {
-              const baseRef = '${{ steps.pr.outputs.base_ref }}';
-              const prTitle = '${{ steps.pr.outputs.title }}';
-              const headRef = '${{ steps.pr.outputs.head_ref }}';
-
-              run(`git fetch origin ${baseRef}:refs/remotes/origin/${baseRef}`);
-              // find common commit 
-              const base = run(`git merge-base HEAD origin/${baseRef}`);
-
-              const msgs = run(`git log --reverse --pretty=format:"%s%n%b" ${base}..HEAD`);
-              const subject = `${prTitle} `;
-              const body = msgs;
-
-              // put all changes since common commit into working tree and commmit them 
-              run(`git reset --soft ${base}`);
-              run(`git commit -m "${subject}" -m "${body.replace(/"/g, '\\"')}"`);
-
-            } catch (error) {
-              console.error('❌ Squash step failed:', error.message);
-              process.exit(1);
-            }
-
-      - name: Rebase onto base branch & resolve submodule conflicts
-        id: final-rebase
-        if: ${{ steps.pr-2.outputs.mergeable != 'true' && steps.final-squash.conclusion == 'success' }}
-        uses: actions/github-script@v7
-        env:
-          GIT_MODULES:  ${{ steps.diff-submodules.outputs.updated_git_modules }}
-        with:
-          script: |
-            const { execSync } = require('child_process');
-            const run = (cmd, options = {}) => {
-              console.log(`$ ${cmd}`);
-              try {
-                return execSync(cmd, { stdio: 'pipe', encoding: 'utf8', ...options }).trim();
-              }
-              catch (err) {
-                console.warn(`⚠️ Command failed but continuing: ${cmd}`);
-                console.warn(err.stdout || err.message);
-                return ''; // return empty string so the job does not immediately exit when we hit the expected merge conflict 
-              }
-            };
-
-            const baseRef = '${{ steps.pr.outputs.base_ref }}';
-            const headRef = '${{ steps.pr.outputs.head_ref }}';
-            const gitModules = JSON.parse(process.env.GIT_MODULES);
-            const submodules = gitModules ? Object.values(gitModules).map(m => m.path.trim().replace(/\/$/, '')) : [];
-
-            run(`git checkout ${headRef}`);
-            run(`git fetch origin ${baseRef}`);
-
-            console.log(` Starting rebase onto origin/${baseRef} ...`);
-
-            const rebaseOutput = run(`git rebase origin/${baseRef}`);
-            if (rebaseOutput.includes('is up to date') || rebaseOutput.includes('Fast-forwarded')) {
-              console.log(' Rebase already up to date.');
-            }
-
-            // Detect conflicted files
-            const conflicted = run(`git diff --name-only --diff-filter=U`).split('\n').filter(Boolean);
-            if (conflicted.length === 0) {
-              console.log(' No conflicts detected.');
-            }
-            console.log(` Conflicts detected in: ${conflicted.join(', ')}`);
-
-            const conflictedSubmodules = conflicted.filter(path => submodules.includes(path));
-            submodules.forEach(sub => run(`git add "${sub}"`));
-            run(`git commit --no-edit`);
-            run(`git rebase --continue`);
-            
-            // confirm the base is now up to date or exit
-            try {
-              execSync(`git rebase origin/${baseRef}`, { stdio: 'inherit' });
-            }catch (err) {
-              core.setFailed("Base still has conflicts");
-              return; 
-            }
-
-            run(`git push --force-with-lease origin ${headRef}`);
-            console.log(' Rebase and push completed successfully.');
-
       # merge base 
         ## pre-form commit title and body including pr link
         ## sign and commit base merge
@@ -1255,19 +1075,54 @@ jobs:
         uses: actions/github-script@v7
         env:
           BRANCH: ${{steps.pr.outputs.head_ref}}
+          BASE_BRANCH: ${{steps.pr.outputs.base_ref}}
+          OWNER: ${{ inputs.owner }}
+          REPO: ${{ inputs.repo }}
         with:
           github-token: ${{ env.RW_PAT }}
           script: |
-            const { execSync } = require('child_process');
-            await execSync(`git fetch origin ${process.env.BRANCH}`, { stdio: 'inherit' });
-            const prNumber = process.env.BASE_PR_NUMBER;
-            // Option to add a loop here. Again alternative is user re-runs because submodules will register as merged and not cause issues. 
-            await github.rest.pulls.merge({
-              owner: process.env.OWNER,
-              repo: process.env.REPO,
-              pull_number: prNumber,
-              merge_method: 'squash'
-            });
+            // Import the pr-utils.js module
+            const fs = require('fs');
+            const path = require('path');
+            const prUtils = require('../../repo/scripts/pr-utils.js');
+            const prNumber = parseInt(process.env.BASE_PR_NUMBER);
+            const headRef = process.env.BRANCH;
+            const baseRef = process.env.BASE_BRANCH;
+            const remote = 'origin';
+            
+            // Get changed submodules if any
+            let submodules = [];
+            try {
+              const changedPathsStr = '${{ steps.changed-submodules.outputs.changed_paths }}';
+              if (changedPathsStr && changedPathsStr !== '[]') {
+                submodules = JSON.parse(changedPathsStr);
+              }
+            } catch (error) {
+              core.warning(`Failed to parse changed submodules: ${error.message}`);
+            }
+            
+            try {
+              // Use localGitMergePipeline instead of github.rest.pulls.merge
+              const result = await prUtils.localGitMergePipeline(
+                core,
+                remote,
+                baseRef,
+                headRef,
+                prNumber,
+                true, // isBase = true since this is the base repository
+                submodules,
+                process.env.OWNER,
+                process.env.REPO
+              );
+              
+              core.info(`Merge result: ${result}`);
+              core.setOutput('result', 'success');
+              core.setOutput('message', result);
+            } catch (error) {
+              core.setFailed(`Failed to merge PR: ${error.message}`);
+              core.setOutput('result', 'failure');
+              core.setOutput('message', error.message);
+            }
 
 
 

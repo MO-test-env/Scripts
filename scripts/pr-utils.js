@@ -1,4 +1,3 @@
-
 /**
  * Squashes all commits in a PR into a single commit using GitHub API
  * @param {object} github - The GitHub API client
@@ -319,8 +318,327 @@ async function apiCherryPickPR(github, core, owner, repo, prNumber) {
   }
 }
 
+/**
+ * Mimic the API call to merge code, but use the separate git commands squash, rebase (with submodule ptr conflict resolution), merge --ff-only, sign and push
+ * @param {object} core - The GitHub Actions core module
+ * @param {string} remote - Remote name
+ * @param {string} tgtBranch - Target or base branch ex Main
+ * @param {string} prBranch - PR branch ex. adc/users/marissao/cdc-2342
+ * @param {number} prNumber - The PR number to merge
+ * @param {boolean} isBase - Whether the PR is a base repo (has submodules) or not (default false)
+ * @param {Array<string>} submodules - Array of submodule paths to handle
+ * @param {string} owner - The organization or user name (optional)
+ * @param {string} repo - The repository name (optional)
+ * @returns {string} - Git status output
+ * @throws {Error} - If there is an error
+ */
+async function localGitMergePipeline(core, remote, tgtBranch, prBranch, prNumber, isBase = false, submodules = [], owner = '', repo = '') {
+  const { execSync } = require('child_process');
+  
+  // Helper function to run git commands with better error handling
+  const run = (cmd, opts = {}) => {
+    const stdio = opts.stdio ?? 'pipe';
+    const encoding = opts.encoding ?? 'utf8';
+    const cwd = opts.cwd ?? process.cwd();
+    core.info(`$ ${cmd}`);
+    try {
+      return execSync(cmd, { stdio, encoding, cwd }).trim();
+    } catch (err) {
+      // Allow graceful failure for specific commands that might fail but we want to continue
+      if (!opts.allowFail) throw err;
+      core.warning(`⚠️ Command failed (continuing): ${cmd}`);
+      core.warning(err.stdout || err.message);
+      return '';
+    }
+  };
+
+  // Initialize PR info 
+  // tgt branch, pr branch, pr title (append PR num), pr body 
+  
+  try {
+    // Fetch the latest from remote for both branches
+    core.info(`Fetching latest from remote for ${tgtBranch} and ${prBranch}...`);
+    run(`git fetch ${remote} ${tgtBranch}:refs/remotes/origin/${tgtBranch}`);
+    run(`git fetch ${remote} ${prBranch}:refs/remotes/origin/${prBranch}`);
+    
+    // Checkout PR branch
+    core.info(`Checking out PR branch ${prBranch}...`);
+    run(`git checkout ${prBranch}`);
+    
+    // Update submodules if this is a base repo
+    if (isBase && submodules.length > 0) {
+      core.info(`Updating submodules: ${submodules.join(', ')}...`);
+      run(`git submodule update --init --recursive ${submodules.join(' ')}`);
+    }
+    
+    // Find merge base and count commits
+    const base = run(`git merge-base HEAD origin/${tgtBranch}`);
+    const commitCount = parseInt(run(`git rev-list --count ${base}..HEAD`), 10);
+    core.info(`Commit count in PR: ${commitCount}`);
+    
+    // Squash commits if there are multiple
+    if (commitCount > 1) {
+      core.info('Multiple commits detected — performing squash.');
+      const msgs = run(`git log --reverse --pretty=format:"%s%n%b" ${base}..HEAD`);
+      const prTitle = `PR #${prNumber}`;
+      run(`git reset --soft ${base}`);
+      run(`git commit -m "${prTitle} - Squash" -m "${msgs.replace(/"/g, '\"')}"`);
+    } else {
+      core.info('Only one commit — skipping squash.');
+    }
+    
+    // Rebase onto target branch
+    core.info(`Starting rebase onto origin/${tgtBranch}...`);
+    
+    if( isBase && submodules.length > 0 ) {
+      run(`git rebase origin/${tgtBranch}`, { allowFail: true });
+      // Handle conflicts if any
+      let hadSubConflicts = false;
+      let conflicted = run(`git diff --name-only --diff-filter=U`, { allowFail: true }).split('\n').filter(Boolean);
+      
+      if (conflicted.length > 0) {
+        core.warning(`⚠️ Rebase conflicts detected: ${conflicted.join(', ')}`);
+        
+        // Separate submodule conflicts from other conflicts
+        const subConflicts = isBase ? 
+          conflicted.filter(f => submodules.some(s => f === s || f.startsWith(`${s}/`))) : [];
+        const nonSubConflicts = conflicted.filter(f => !submodules.some(s => f === s || f.startsWith(`${s}/`)));
+        
+        // Set flag if we have submodule conflicts
+        hadSubConflicts = subConflicts.length > 0;
+        
+        // Non-submodule conflicts require manual intervention
+        if (nonSubConflicts.length > 0) {
+          core.setFailed(`❌ Rebase conflicts in non-submodule files:\n${nonSubConflicts.join('\n')}`);
+          core.setOutput('failMsg', `Workflow stopped because rebase conflicts in non-submodule files:\n${nonSubConflicts.join('\n')}`);
+          process.exit(1);
+        }
+        
+        // Auto-resolve submodule conflicts
+        if (subConflicts.length > 0) {
+          core.info(`Submodule conflicts only — auto-resolving.`);
+          subConflicts.forEach(sub => run(`git add "${sub}"`));
+          run(`git commit --no-edit`);
+          run(`git rebase --continue`, { allowFail: true });
+        }
+      } else {
+        core.info('No rebase conflicts detected.');
+        // Final validation
+        let rebaseSuccessful = false;
+        try {
+          const finalRebase = run(`git rebase origin/${tgtBranch}`, { allowFail: true });
+          if (/up to date/i.test(finalRebase) || /no rebase in progress/i.test(finalRebase)) {
+            core.info('Branch already up to date — Confirmed no more conflicts.');
+            rebaseSuccessful = true;
+          } else if (finalRebase.includes('error') || finalRebase.includes('conflict')) {
+            core.setFailed('❌ Rebase failed — unresolved conflicts remain.');
+            core.setOutput('failMsg', 'Unresolved conflicts remain after rebase.');
+            process.exit(1);
+          } else {
+            rebaseSuccessful = true;
+          }
+        } catch (err) {
+          core.setFailed('❌ Rebase failed — unresolved conflicts remain.');
+          core.setOutput('failMsg', 'Unresolved conflicts remain after rebase.');
+          process.exit(1);
+        }
+        
+        // Push changes to PR branch if needed
+        if (hadSubConflicts && rebaseSuccessful) {
+          core.info('Pushing changes with --force-with-lease because submodule conflicts were resolved');
+          run(`git push ${remote} ${prBranch} --force-with-lease`);
+        } else if (rebaseSuccessful) {
+          core.info('Pushing rebased changes to PR branch');
+          run(`git push ${remote} ${prBranch} --force-with-lease`);
+        }
+      }
+    } else {
+      run(`git rebase origin/${tgtBranch}`, { allowFail: false });
+    }
+
+    // Checkout target branch and update
+    core.info(`Checking out target branch ${tgtBranch}...`);
+    run(`git checkout ${tgtBranch}`);
+    run(`git pull ${remote} ${tgtBranch}`);
+    
+    // Merge PR branch into target branch with fast-forward only
+    core.info(`Merging PR branch ${prBranch} into ${tgtBranch} with fast-forward only...`);
+    /**
+     * The fast forward flag is integral to merging without a merge commit - Mimics cherry pick operation because we just squashed/rebased/pushed PR
+     * Based on the documentation linked below, this command in combination with a newly rebased code is the only non API way to get the PR to be marked as merged.    
+     * https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/incorporating-changes-from-a-pull-request/about-pull-request-merges#indirect-merges
+     */
+    const mergeOutput = run(`git merge --ff-only ${prBranch}`);
+    
+    // Push changes to target branch
+    core.info(`Pushing changes to ${tgtBranch}...`);
+    const pushOutput = run(`git push ${remote} ${tgtBranch}`);
+    
+    // Return the final status
+    const finalOutput = `Successfully merged PR #${prNumber} from ${prBranch} into ${tgtBranch}`;
+    core.info(finalOutput);
+    return finalOutput;
+    
+  } catch (error) {
+    core.error(`Error in git merge pipeline: ${error.message}`);
+    throw error;
+  }
+}
+
+
+/**
+ * Updates submodules to the top of their target branches and commits any changes
+ * @param {object} core - The GitHub Actions core module
+ * @param {string} remote - Remote name (e.g., 'origin')
+ * @param {Array<object>} submodules - Array of submodule objects with path and targetBranch properties
+ * @param {string} commitMessage - Message for the commit if changes are detected
+ * @param {boolean} pushChanges - Whether to push changes to remote (default: false)
+ * @returns {object} - Result object with updated submodules and status
+ * @throws {Error} - If there is an error
+ */
+async function localGitBumpSubmodules(core, remote, submodules, commitMessage, pushChanges = false) {
+  const { execSync } = require('child_process');
+  
+  // Helper function to run git commands with better error handling
+  const run = (cmd, opts = {}) => {
+    const stdio = opts.stdio ?? 'pipe';
+    const encoding = opts.encoding ?? 'utf8';
+    const cwd = opts.cwd ?? process.cwd();
+    core.info(`$ ${cmd}`);
+    try {
+      return execSync(cmd, { stdio, encoding, cwd }).trim();
+    } catch (err) {
+      // Allow graceful failure for specific commands that might fail but we want to continue
+      if (!opts.allowFail) throw err;
+      core.warning(`⚠️ Command failed (continuing): ${cmd}`);
+      core.warning(err.stdout || err.message);
+      return '';
+    }
+  };
+
+  // Store original branch to return to it later
+  const originalBranch = run('git rev-parse --abbrev-ref HEAD');
+  core.info(`Current branch: ${originalBranch}`);
+  
+  // Initialize results
+  const result = {
+    updatedSubmodules: [],
+    noChanges: [],
+    errors: [],
+    status: 'success'
+  };
+  
+  try {
+    // Make sure we have the latest from remote
+    core.info('Fetching latest from remote...');
+    run(`git fetch ${remote}`);
+    
+    // Process each submodule
+    for (const submodule of submodules) {
+      const { path, targetBranch } = submodule;
+      
+      if (!path || !targetBranch) {
+        core.warning(`⚠️ Skipping submodule with missing path or targetBranch: ${JSON.stringify(submodule)}`);
+        result.errors.push(`Invalid submodule config: ${JSON.stringify(submodule)}`);
+        continue;
+      }
+      
+      core.info(`Processing submodule: ${path} (target branch: ${targetBranch})`);
+      
+      try {
+        // Enter the submodule directory
+        core.info(`Entering submodule directory: ${path}`);
+        const cwd = process.cwd();
+        process.chdir(path);
+        
+        // Fetch the latest from remote for the target branch
+        core.info(`Fetching latest for ${targetBranch}...`);
+        run(`git fetch ${remote} ${targetBranch}`);
+        
+        // Get current commit
+        const currentCommit = run('git rev-parse HEAD');
+        core.info(`Current commit: ${currentCommit.substring(0, 8)}`);
+        
+        // Get latest commit on target branch
+        const latestCommit = run(`git rev-parse ${remote}/${targetBranch}`);
+        core.info(`Latest commit on ${targetBranch}: ${latestCommit.substring(0, 8)}`);
+        
+        // Check if we need to update
+        if (currentCommit !== latestCommit) {
+          core.info(`Updating submodule ${path} to latest on ${targetBranch}...`);
+          
+          // Checkout the target branch
+          run(`git checkout ${targetBranch}`);
+          
+          // Pull the latest changes
+          run(`git pull ${remote} ${targetBranch}`);
+          
+          // Go back to parent repo directory
+          process.chdir(cwd);
+          
+          // Stage the submodule change
+          run(`git add ${path}`);
+          
+          result.updatedSubmodules.push({
+            path,
+            previousCommit: currentCommit.substring(0, 8),
+            newCommit: latestCommit.substring(0, 8)
+          });
+        } else {
+          core.info(`Submodule ${path} is already at the latest commit on ${targetBranch}`);
+          process.chdir(cwd);
+          result.noChanges.push(path);
+        }
+      } catch (err) {
+        core.warning(`⚠️ Error processing submodule ${path}: ${err.message}`);
+        result.errors.push(`${path}: ${err.message}`);
+        // Make sure we're back in the parent repo directory
+        try {
+          process.chdir(cwd);
+        } catch (e) {
+          // Ignore errors when trying to change back to cwd
+        }
+      }
+    }
+    
+    // Commit changes if any submodules were updated
+    if (result.updatedSubmodules.length > 0) {
+      core.info('Committing submodule updates...');
+      const message = commitMessage || `Update submodules to latest on their target branches\n\nUpdated: ${result.updatedSubmodules.map(s => s.path).join(', ')}`;
+      run(`git commit -m "${message}"`);
+      
+      // Push changes if requested
+      if (pushChanges) {
+        core.info('Pushing submodule updates to remote...');
+        run(`git push ${remote} ${originalBranch}`);
+      }
+      
+      core.info('Submodule updates committed successfully.');
+    } else {
+      core.info('No submodule updates to commit.');
+    }
+    
+    // Return to original branch if we're not already on it
+    const currentBranch = run('git rev-parse --abbrev-ref HEAD');
+    if (currentBranch !== originalBranch) {
+      core.info(`Returning to original branch: ${originalBranch}`);
+      run(`git checkout ${originalBranch}`);
+    }
+    
+  } catch (error) {
+    core.error(`Error in git bump submodules: ${error.message}`);
+    result.status = 'failed';
+    result.errors.push(error.message);
+  }
+  
+  return result;
+}
+
+// Export the functions
 module.exports = {
   apiSquashPR,
   apiRebasePR,
-  apiCherryPickPR
+  apiCherryPickPR,
+  localGitMergePipeline, 
+  localGitBumpSubmodules, 
 };
