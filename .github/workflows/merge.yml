@@ -867,11 +867,8 @@ jobs:
                     remote,
                     baseRef,
                     headRef,
-                    prNumber,
-                    true, // isBase = true since this is the base repository
-                    submodules,
-                    process.env.OWNER,
-                    process.env.REPO
+                    pr,
+                    false, // isBase = false for submodules
                     [],
                     owner,
                     repo
