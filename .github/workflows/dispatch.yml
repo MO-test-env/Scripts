@@ -47,14 +47,17 @@ jobs:
         with:
           fetch-depth: 1
           
-      # - name: Checkout utils repository
-      #   uses: actions/checkout@v4
-      #   with:
-      #     repository: CSG-Firmware-Engineering/CDC_Ags_Scripts
-      #     path: CDC_Ags_Scripts
-      #     sparse-checkout: scripts/pr-utils.js
-      #     sparse-checkout-cone-mode: false
-          
+      - name: Checkout utils repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          repository: MO-test-env/orgScripts
+          ref: main
+          path: utils
+          sparse-checkout: scripts/pr-utils.js
+          sparse-checkout-cone-mode: false
+          token: ${{ env.RW_PAT }}
+
       - name: Squash 
         id: squash
         uses: actions/github-script@v7
@@ -68,7 +71,7 @@ jobs:
             // Import the pr-utils.js module
             const fs = require('fs');
             const path = require('path');
-            const prUtils = require('./scripts/pr-utils.js');
+            const prUtils = require('./utils/scripts/pr-utils.js'); 
             
             // Call the apiSquashPR function
             const result = await prUtils.apiSquashPR(github, core, owner, repo, prNumber);
@@ -97,7 +100,7 @@ jobs:
             // Import the pr-utils.js module
             const fs = require('fs');
             const path = require('path');
-            const prUtils = require('./scripts/pr-utils.js');
+            const prUtils = require('./utils/scripts/pr-utils.js'); 
             
             // Call the apiRebasePR function
             const result = await prUtils.apiRebasePR(github, core, owner, repo, prNumber);
