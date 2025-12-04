@@ -7,7 +7,7 @@
  * @param {number} prNumber - The PR number to squash
  * @returns {object} - Result object with squashNeeded and result properties
  */
-async function apiSquashPR(github, core, owner, repo, prNumber) {
+/* async function apiSquashPR(github, core, owner, repo, prNumber) {
   try {
     const pr = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
     const { data: commits } = await github.rest.pulls.listCommits({ owner, repo, pull_number: prNumber });
@@ -55,7 +55,7 @@ async function apiSquashPR(github, core, owner, repo, prNumber) {
     core.error(`Error squashing PR: ${error.message}`);
     throw error;
   }
-}
+} */
 
 /**
  * Rebases a PR branch on top of its target branch using GitHub API
@@ -66,7 +66,7 @@ async function apiSquashPR(github, core, owner, repo, prNumber) {
  * @param {number} prNumber - The PR number to rebase
  * @returns {object} - Result object with rebaseNeeded and result properties
  */
-async function apiRebasePR(github, core, owner, repo, prNumber) {
+/* async function apiRebasePR(github, core, owner, repo, prNumber) {
   try {
     // Get PR info
     const pr = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
@@ -196,7 +196,7 @@ async function apiRebasePR(github, core, owner, repo, prNumber) {
     core.error(`Rebase failed: ${err.message}`);
     return { rebaseNeeded: true, result: "failed", error: err.message };
   }
-}
+} */
 
 /**
  * Cherry-picks a PR branch onto the updated base branch using GitHub API
@@ -207,7 +207,7 @@ async function apiRebasePR(github, core, owner, repo, prNumber) {
  * @param {number} prNumber - The PR number to cherry-pick
  * @returns {object} - Result object with cherryPickNeeded and result properties
  */
-async function apiCherryPickPR(github, core, owner, repo, prNumber) {
+/* async function apiCherryPickPR(github, core, owner, repo, prNumber) {
   try {
     // Get PR info
     const pr = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
@@ -316,7 +316,7 @@ async function apiCherryPickPR(github, core, owner, repo, prNumber) {
     core.error(`Error cherry-picking PR: ${error.message}`);
     return { cherryPickNeeded: true, result: "failed", error: error.message };
   }
-}
+} */
 
 /**
  * Mimic the API call to merge code, but use the separate git commands squash, rebase (with submodule ptr conflict resolution), merge --ff-only, sign and push
@@ -329,10 +329,11 @@ async function apiCherryPickPR(github, core, owner, repo, prNumber) {
  * @param {Array<string>} submodules - Array of submodule paths to handle
  * @param {string} owner - The organization or user name (optional)
  * @param {string} repo - The repository name (optional)
+ * @param {string} submodulePath - Optional path to submodule if this is a submodule merge (default empty string)
  * @returns {string} - Git status output
  * @throws {Error} - If there is an error
  */
-async function localGitMergePipeline(core, remote, tgtBranch, prBranch, prNumber, isBase = false, submodules = [], owner = '', repo = '') {
+async function localGitMergePipeline(core, remote, prNumber, tgtBranch, prBranch, isBase = false, submodules = [], owner = '', repo = '', submodulePath = '') {
   const { execSync } = require('child_process');
   
   // Helper function to run git commands with better error handling
@@ -352,18 +353,33 @@ async function localGitMergePipeline(core, remote, tgtBranch, prBranch, prNumber
     }
   };
 
+  // Store the original working directory
+  const originalCwd = process.cwd();
+  
+  // If this is a submodule merge, cd into the submodule path
+  if (submodulePath) {
+    core.info(`Changing directory to submodule path: ${submodulePath}`);
+    try {
+      process.chdir(submodulePath);
+      core.info(`Successfully changed to submodule directory: ${process.cwd()}`);
+    } catch (err) {
+      core.warning(`Failed to validate submodule path ${submodulePath}: ${err.message}`);
+    }
+  }
+
   // Initialize PR info 
   // tgt branch, pr branch, pr title (append PR num), pr body 
   
   try {
     // Fetch the latest from remote for both branches
     core.info(`Fetching latest from remote for ${tgtBranch} and ${prBranch}...`);
-    run(`git fetch ${remote} ${tgtBranch}:refs/remotes/origin/${tgtBranch}`);
-    run(`git fetch ${remote} ${prBranch}:refs/remotes/origin/${prBranch}`);
-    
+    run(`git fetch --no-tags --deepen=99999 ${remote} ${tgtBranch}`);
+    run(`git fetch --no-tags --deepen=99999 ${remote} ${prBranch}`);
+    const st = run(`git status`);
+    core.info(st);
     // Checkout PR branch
     core.info(`Checking out PR branch ${prBranch}...`);
-    run(`git checkout ${prBranch}`);
+    run(`git checkout -b ${prBranch} origin/${prBranch}`);
     
     // Update submodules if this is a base repo
     if (isBase && submodules.length > 0) {
@@ -468,11 +484,11 @@ async function localGitMergePipeline(core, remote, tgtBranch, prBranch, prNumber
      * Based on the documentation linked below, this command in combination with a newly rebased code is the only non API way to get the PR to be marked as merged.    
      * https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/incorporating-changes-from-a-pull-request/about-pull-request-merges#indirect-merges
      */
-    const mergeOutput = run(`git merge --ff-only ${prBranch}`);
+    // const mergeOutput = run(`git merge --ff-only ${prBranch}`);
     
     // Push changes to target branch
     core.info(`Pushing changes to ${tgtBranch}...`);
-    const pushOutput = run(`git push ${remote} ${tgtBranch}`);
+    // const pushOutput = run(`git push ${remote} ${tgtBranch}`);
     
     // Return the final status
     const finalOutput = `Successfully merged PR #${prNumber} from ${prBranch} into ${tgtBranch}`;
@@ -483,162 +499,629 @@ async function localGitMergePipeline(core, remote, tgtBranch, prBranch, prNumber
     core.error(`Error in git merge pipeline: ${error.message}`);
     throw error;
   }
+  // Always cd back to the original working directory
+  if (submodulePath) {
+    core.info(`Changing directory back to original path: ${originalCwd}`);
+    try {
+      process.chdir(originalCwd);
+      core.info(`Successfully returned to original directory: ${process.cwd()}`);
+    } catch (err) {
+      core.warning(`Failed to return to original directory: ${err.message}`);
+    }
+  }
+}
+
+/**
+ * Checks the number of approvals and change requests for a PR
+ * @param {object} github - The GitHub API client
+ * @param {object} core - The GitHub Actions core module
+ * @param {number} prNumber - The PR number to check
+ * @param {string} owner - The organization name
+ * @param {string} repo - The repository name
+ * @returns {object} - Object containing approvalCount and changeRequestCount
+ */
+async function checkPrApprovals(github, core, prNumber, owner, repo) {
+  // Check approvals 
+  const { data: reviews } = await github.rest.pulls.listReviews({
+    owner: owner,
+    repo: repo,
+    pull_number: prNumber,
+  });
+  
+  const latestByUser = {};
+  for (const review of reviews) {
+    latestByUser[review.user.login] = review.state;
+  }
+  const approvedUsers = Object.values(latestByUser).filter(s => s === 'APPROVED');
+  const approvalCount = approvedUsers.length;
+  const changeRequestCount = Object.values(latestByUser).filter(s => s === 'CHANGES_REQUESTED').length;
+  
+  return {
+    approvalCount,
+    changeRequestCount
+  };
+}
+
+/**
+ * Parses .gitmodules file and filters submodules based on changed paths
+ * @param {object} github - The GitHub API client
+ * @param {object} core - The GitHub Actions core module
+ * @param {number} prNumber - The PR number (not used in this function)
+ * @param {string} owner - The organization name
+ * @param {string} repo - The repository name
+ * @param {string} baseRef - The base reference/branch
+ * @returns {object} - Object containing filtered raw submodules
+ */
+async function initSubmodsFromGitModules(github, core, prNumber, owner, repo, baseRef, ) {
+  // Load .gitmodules
+  let content = "";
+  try {
+    const { data: f } = await github.rest.repos.getContent({
+      owner: owner,
+      repo: repo,
+      path: ".gitmodules",
+      ref: baseRef
+    });
+
+    content = Buffer.from(f.content, "base64").toString("utf8");
+  } catch (err) {
+    core.setFailed("Failed to load .gitmodules: " + err.message);
+    throw err;
+  }
+
+  const lines = content.split("\n");
+  const rawSubmodules = {};
+  let current = null;
+
+  for (const line of lines) {
+    const sub = line.match(/\[submodule \"(.*)\"\]/);
+    const path = line.match(/\s*path = (.*)/);
+    const url = line.match(/\s*url = (.*)/);
+    const br = line.match(/\s*branch = (.*)/);
+
+    if (sub) {
+      current = sub[1];
+      rawSubmodules[current] = {};
+    } else if (current && path) {
+      rawSubmodules[current].path = path[1].trim();
+    } else if (current && url) {
+      rawSubmodules[current].url = url[1].trim();
+    } else if (current && br) {
+      rawSubmodules[current].configuredBranch = br[1].trim();
+    }
+  }
+
+  core.info("Raw submodules from reading file:");
+  core.info(JSON.stringify(rawSubmodules, null, 2));
+  return rawSubmodules;
+}
+
+/**
+ * Determines PR conflicts and changed submodules from PR diff
+ * @param {object} github - The GitHub API client
+ * @param {object} core - The GitHub Actions core module
+ * @param {number} prNumber - The PR number to check
+ * @param {string} owner - The organization name
+ * @param {string} repo - The repository name
+ * @returns {object} - Object containing changed_submodules and base_ref
+ */
+async function getChangedSubmodules(github, core, prNumber, owner, repo) {
+  // Get PR details and files
+  const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
+  const { data: files } = await github.rest.pulls.listFiles({ owner, repo, pull_number: prNumber, per_page: 300 });
+
+  // Collect all changed file paths
+  const changedFilesSet = new Set();
+  const changedSubmodulesSet = new Set();
+
+  for (const f of files) {
+    const filename = f.filename;
+    changedFilesSet.add(filename);
+
+    const parts = filename.split("/");
+    const baseName = parts[parts.length - 1];
+
+    // Treat files whose basename has no '.' as submodules
+    if (baseName && !baseName.includes(".")) {
+      changedSubmodulesSet.add(filename);
+    }
+  }
+
+  const changedFiles = Array.from(changedFilesSet);
+  const changedSubmodules = Array.from(changedSubmodulesSet);
+
+  core.info(`Changed files: ${JSON.stringify(changedFiles)}`);
+  core.info(`Changed submodules (no extension): ${JSON.stringify(changedSubmodules)}`);
+
+  return {
+    changed_submodules: changedSubmodules,
+    changed_files: changedFiles,
+    base_ref: pr.base.ref,
+    pr_ref: pr.head.ref
+  };
+}
+
+/**
+ * Analyzes PR to find files with conflicts
+ * @param {object} github - The GitHub API client
+ * @param {object} core - The GitHub Actions core module
+ * @param {number} prNumber - The PR number to check
+ * @param {string} owner - The organization name
+ * @param {string} repo - The repository name
+ * @param {Array<string>} submodulePaths - List of submodule paths to check against
+ * @returns {object} - Object containing files_with_conflicts categorized by type and mergeable status
+ */
+async function getConflictedFiles(github, core, prNumber, owner, repo, submodulePaths = []) {
+  // Get PR details including mergeability status
+  const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
+  
+  let filesWithConflicts = [];
+  
+  // Check if PR is mergeable
+  if (pr.mergeable === false) {
+    core.info(`PR #${prNumber} is not mergeable; analyzing possible conflicts...`);
+    try {
+      // detect potential conflicts
+      const { data: comp } = await github.rest.repos.compareCommits({
+        owner, repo, base: pr.base.ref, head: pr.head.ref
+      });
+      
+      if (comp.status === "diverged") {
+        const mergeBase = comp.merge_base_commit.sha;
+        
+        // Helper function that gets changed files for a sha
+        const getChangedFiles = async (ref) => {
+          try {
+            const { data } = await github.rest.repos.compareCommits({
+              owner, repo, base: mergeBase, head: ref
+            });
+            return new Set(data.files.map(f => f.filename));
+          } catch {
+            return new Set();
+          }
+        }; // end helper function
+
+        const baseFiles = await getChangedFiles(pr.base.ref);
+        const headFiles = await getChangedFiles(pr.head.ref);
+
+        // Files modified in both branches are likely to have conflicts
+        filesWithConflicts = Array.from(baseFiles).filter(file => headFiles.has(file));
+        
+        if (filesWithConflicts.length > 0) {
+          core.info(`Found ${filesWithConflicts.length} potentially conflicting files via comparison API`);
+          core.info(`Potentially conflicting files: ${JSON.stringify(filesWithConflicts)}`);
+        }
+      }
+    } catch (err) {
+      core.warning(`Could not compute conflict info: ${err.message}`);
+    }
+  } else {
+    core.info(`PR #${prNumber} is mergeable, no conflicts detected`);
+  }
+  
+  // Separate conflicts into submodule conflicts and non-submodule conflicts
+  const submoduleConflicts = [];
+  const nonSubmoduleConflicts = [];
+  
+  filesWithConflicts.forEach(filename => {
+    // Check if this file is within a known submodule path
+    const isInSubmodule = submodulePaths.some(subPath => 
+      filename === subPath || filename.startsWith(`${subPath}/`)
+    );
+    
+    if (isInSubmodule) {
+      submoduleConflicts.push(filename);
+    } else {
+      nonSubmoduleConflicts.push(filename);
+    }
+  });
+
+  const hasNonSubmoduleConflict = nonSubmoduleConflicts.length > 0;
+  if (hasNonSubmoduleConflict) {
+    core.setFailed(`❌ Conflicts in non-submodule files:\n${nonSubmoduleConflicts.join('\n')}`);
+    throw new Error(`Workflow stopped because of base conflicts in non-submodule files:\n${nonSubmoduleConflicts.join('\n')}`);
+  }
+
+  core.info(`Submodule conflicts: ${JSON.stringify(submoduleConflicts)}`);
+  core.info(`Non-submodule conflicts: ${JSON.stringify(nonSubmoduleConflicts)}`);
+
+  return {
+    files_with_conflicts: [...submoduleConflicts, ...nonSubmoduleConflicts],
+    submodule_conflicts: submoduleConflicts,
+    non_submodule_conflicts: nonSubmoduleConflicts,
+    mergeable: pr.mergeable
+  };
+}
+
+/**
+ * Enriches submodule information with default branches, repoName, baseBranch, SHA, PRbranch, and PR number
+ * @param {object} github - The GitHub API client
+ * @param {object} core - The GitHub Actions core module
+ * @param {string} owner - The organization name
+ * @param {string} repo - The repository name
+ * @param {object} rawSubmodules - Raw submodules object from initSubmodsFromGitModules
+ * @param {string} baseRef - The base reference/branch
+ * @param {string} prBranchRef - The PR branch reference
+ * @param {boolean} isMergeIntoDefaultBranch - Whether this BASE PR is merging into the default branch
+ * @returns {object} - Enriched submodules with additional information
+ */
+async function enrichSubmodules(github, core, owner, repo, rawSubmodules, baseRef, prBranchRef, isMergeIntoDefaultBranch = false) {
+  
+  let enriched = {};
+  // Process each submodule
+  for (const [name, data] of Object.entries(rawSubmodules)) {
+    const { path, url, configuredBranch } = data;
+
+    if (!path || !url) continue;
+
+    // Get repository name from URL
+    const repoName = await deriveRepoNameFromUrl(url);
+    core.info(`Submodule ${name} resolves repoName: ${repoName}`);
+
+    // Get default branch
+    const subDefaultBranch = await getDefaultBranch(github, core, owner, repoName);
+    if (!subDefaultBranch) continue;
+
+    // Compute base branch
+    const baseBranch = await computeBaseBranch(core, baseRef, subDefaultBranch, isMergeIntoDefaultBranch);
+
+    // Initialize enriched submodule data
+    enriched[name] = {
+      path,
+      url,
+      repoName,
+      configuredBranch,
+      subDefaultBranch,
+      baseBranch
+    };
+
+    try {
+      // Get the SHA of the submodule from the PR branch
+      const { data: prContent } = await github.rest.repos.getContent({
+        owner,
+        repo,
+        path,
+        ref: prBranchRef 
+      });
+
+      if (!prContent || prContent.type !== "submodule") {
+        // Not submodule change so ignore
+        continue;
+      }
+
+      const sha = prContent.sha;
+
+      // Find branches where the SHA is at the head
+      const branchesContainingSha = await findBranchesForHeadCommit(github, core, owner, repoName, sha);
+
+      // Check if SHA is on the base branch
+      const isShaOnBaseBranch = await shaInBranch(github, owner, repoName, baseBranch, sha);
+      core.info(`SHA ${sha} is on base branch ${baseBranch}: ${isShaOnBaseBranch}`);
+
+      // Find all PRs associated with the commit
+      const prs = await findPRsForCommit(github, core, owner, repoName, sha);
+
+      // Determine PR branch and number
+      const { prBranch, prNumber } = await determinePRBranchAndNumber(
+        github, core, sha, repoName, baseBranch, isShaOnBaseBranch, branchesContainingSha, prs
+      );
+
+      // Update enriched submodule data
+      enriched[name] = {
+        ...enriched[name],
+        sha,
+        prBranch,
+        prNumber
+      };
+
+      core.info(`Resolved ${name}: sha=${sha}, branch=${prBranch}, prNumber=${prNumber}`);
+    } catch (err) {
+      core.warning(`Error processing submodule ${name}: ${err.message}`);
+    }
+  }
+  // for each submodule from changed submodules
+  // get repo name from url 
+  // get default branh 
+  // get tgt branch - if base is mergeIntoDefault then that - otherwise use same as base 
+
+  // add submod sha
+  // add submod pr Branch 
+  // get submod has PR num   
+
+  return enriched;
+}
+
+/**
+ * Derives repository name from URL
+ * @param {string} url - Repository URL
+ * @returns {string} - Repository name
+ */
+async function deriveRepoNameFromUrl(url) {
+  let repoName = null;
+
+  if (url.startsWith("https://github.com/")) {
+    repoName = url.replace("https://github.com/", "")
+                  .replace(".git", "")
+                  .split("/")[1];
+  } else if (url.startsWith("git@github.com:")) {
+    repoName = url.replace("git@github.com:", "")
+                  .replace(".git", "")
+                  .split("/")[1];
+  } else if (url.startsWith("../")) {
+    repoName = url.replace("../", "").replace(".git", "");
+  } else {
+    repoName = url.split(/[\/:]/).pop().replace(".git", "");
+  }
+
+  return repoName;
+}
+
+/**
+ * Gets default branch for a repository
+ * @param {object} github - The GitHub API client
+ * @param {object} core - The GitHub Actions core module
+ * @param {string} owner - The organization name
+ * @param {string} repoName - Repository name
+ * @returns {string|null} - Default branch name or null if not found
+ */
+async function getDefaultBranch(github, core, owner, repoName) {
+  try {
+    const { data: repoInfo } = await github.rest.repos.get({
+      owner,
+      repo: repoName
+    });
+    return repoInfo.default_branch;
+  } catch (err) {
+    core.warning(`Failed repo lookup for ${repoName}: ${err.message}`);
+    return null;
+  }
+}
+
+/**
+ * Computes base branch for a submodule
+ * @param {object} core - The GitHub Actions core module
+ * @param {string} baseRef - The base reference/branch
+ * @param {string} subDefaultBranch - Submodule's default branch
+ * @param {boolean} isMergeIntoDefaultBranch - Whether this is merging into default branch
+ * @returns {string} - Base branch to use
+ */
+async function computeBaseBranch(core, baseRef, subDefaultBranch, isMergeIntoDefaultBranch) {
+  if (isMergeIntoDefaultBranch) {
+    core.info(`Using default branch '${subDefaultBranch}' for submodule`);
+    return subDefaultBranch;
+  } else {
+    core.info(`Using PR base_ref '${baseRef}' for submodule`);
+    return baseRef;
+  }
+}
+
+/**
+ * Checks if a SHA is anywhere on a branch (not only HEAD)
+ * @param {object} github - The GitHub API client
+ * @param {string} repoOwner - Repository owner
+ * @param {string} repoName - Repository name
+ * @param {string} branch - Branch name
+ * @param {string} sha - SHA to check
+ * @returns {boolean} - True if SHA is on branch, false otherwise
+ */
+async function shaInBranch(github, repoOwner, repoName, branch, sha) {
+  try {
+    const { data: commits } = await github.rest.repos.listCommits({
+      owner: repoOwner,
+      repo: repoName,
+      sha: branch,
+      per_page: 100
+    });
+    return commits.some(c => c.sha === sha);
+  } catch (err) {
+    return false;
+  }
+}
+
+/**
+ * Finds branches where a SHA is at the head
+ * @param {object} github - The GitHub API client
+ * @param {object} core - The GitHub Actions core module
+ * @param {string} repoOwner - Repository owner
+ * @param {string} repoName - Repository name
+ * @param {string} sha - SHA to check
+ * @returns {string[]} - Array of branch names
+ */
+async function findBranchesForHeadCommit(github, core, repoOwner, repoName, sha) {
+  try {
+    core.info(`Attempting to find branches for head commit ${sha} in repository ${repoOwner}/${repoName}`);
+    const { data: branches } = await github.rest.repos.listBranchesForHeadCommit({
+      owner: repoOwner,
+      repo: repoName,
+      commit_sha: sha
+    });
+    const branchNames = branches.map(b => b.name);
+    core.info(`Found ${branchNames.length} branch(es) containing SHA ${sha}: ${branchNames.join(', ')}`);
+    return branchNames;
+  } catch (err) {
+    core.warning(`Could not list branches for head commit ${sha}: ${err.message}`);
+    return [];
+  }
+}
+
+/**
+ * Finds PRs associated with a commit
+ * @param {object} github - The GitHub API client
+ * @param {object} core - The GitHub Actions core module
+ * @param {string} repoOwner - Repository owner
+ * @param {string} repoName - Repository name
+ * @param {string} sha - SHA to check
+ * @returns {object[]} - Array of PR objects
+ */
+async function findPRsForCommit(github, core, repoOwner, repoName, sha) {
+  try {
+    const { data: prList } = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+      owner: repoOwner,
+      repo: repoName,
+      commit_sha: sha
+    });
+    return prList;
+  } catch (err) {
+    core.warning(`Unable to find PRs associated with ${sha}: ${err.message}`);
+    return [];
+  }
+}
+
+/**
+ * Determines PR branch and number based on SHA
+ * @param {object} github - The GitHub API client
+ * @param {object} core - The GitHub Actions core module
+ * @param {string} sha - Commit SHA
+ * @param {string} repoName - Repository name
+ * @param {string} baseBranch - Base branch
+ * @param {boolean} isShaOnBaseBranch - Whether SHA is on base branch
+ * @param {string[]} branchesContainingSha - Branches containing SHA
+ * @param {object[]} prs - PRs associated with SHA
+ * @returns {object} - Object containing PR branch and number
+ */
+async function determinePRBranchAndNumber(github, core, sha, repoName, baseBranch, isShaOnBaseBranch, branchesContainingSha, prs) {
+  let prBranch = null;
+  let prNumber = null;
+
+  const openPRs = prs.filter(pr => pr.state === "open");
+  const mergedPRs = prs.filter(pr => pr.merged_at);
+
+  // SHA on delivery branch 
+  if (isShaOnBaseBranch) {
+    prBranch = baseBranch;
+    prNumber = 0;
+  }
+  // SHA has exactly one open PR
+  else if (openPRs.length === 1) {
+    const prObj = openPRs[0];
+    prBranch = prObj.head.ref;
+    prNumber = prObj.number;
+
+    // warning if head-of-branch contradicts PR branch
+    if (branchesContainingSha.length === 1 && branchesContainingSha[0] !== prBranch) {
+      core.warning(
+        `SHA ${sha} is HEAD of '${branchesContainingSha[0]}' but open PR uses branch '${prBranch}'.`
+      );
+    }
+  }
+  // SHA has merged PR(s)
+  else if (mergedPRs.length >= 1) {
+    const latest = mergedPRs.sort(
+      (a, b) => new Date(b.merged_at) - new Date(a.merged_at)
+    )[0];
+
+    prBranch = latest.head.ref;
+    prNumber = latest.number;
+  }
+  // SHA is HEAD of exactly one branch → no PR yet
+  else if (branchesContainingSha.length === 1) {
+    prBranch = branchesContainingSha[0];
+    prNumber = -1;
+  }
+  // SHA is HEAD of multiple branches → ambiguous
+  else if (branchesContainingSha.length > 1) {
+    core.setFailed(
+      `SHA ${sha} is HEAD of multiple branches (${branchesContainingSha}) and has no PR.`
+    );
+  }
+  // No PRs, not on head, not on base branch → fail
+  else {
+    core.setFailed(
+      `Could not determine PR or branch for SHA ${sha}. Not on default branch, not head of branch, no PRs.`
+    );
+  }
+
+  return { prBranch, prNumber };
 }
 
 
 /**
- * Updates submodules to the top of their target branches and commits any changes
+ * Determines PR conflicts and changed submodules from PR diff
+ * Uses GitHub API to get files with conflicts from PR mergeability status 
+ * @param {object} github - The GitHub API client
  * @param {object} core - The GitHub Actions core module
- * @param {string} remote - Remote name (e.g., 'origin')
- * @param {Array<object>} submodules - Array of submodule objects with path and targetBranch properties
- * @param {string} commitMessage - Message for the commit if changes are detected
- * @param {boolean} pushChanges - Whether to push changes to remote (default: false)
- * @returns {object} - Result object with updated submodules and status
- * @throws {Error} - If there is an error
+ * @param {number} prNumber - The PR number to check
+ * @param {string} owner - The organization name
+ * @param {string} repo - The repository name
+ * @param {boolean} isMergeIntoDefaultBranch - Whether this BASE PR is merging into the default branch
+ * @returns {object} - Object containing changed_submodules and files_with_conflicts
  */
-async function localGitBumpSubmodules(core, remote, submodules, commitMessage, pushChanges = false) {
-  const { execSync } = require('child_process');
-  
-  // Helper function to run git commands with better error handling
-  const run = (cmd, opts = {}) => {
-    const stdio = opts.stdio ?? 'pipe';
-    const encoding = opts.encoding ?? 'utf8';
-    const cwd = opts.cwd ?? process.cwd();
-    core.info(`$ ${cmd}`);
-    try {
-      return execSync(cmd, { stdio, encoding, cwd }).trim();
-    } catch (err) {
-      // Allow graceful failure for specific commands that might fail but we want to continue
-      if (!opts.allowFail) throw err;
-      core.warning(`⚠️ Command failed (continuing): ${cmd}`);
-      core.warning(err.stdout || err.message);
-      return '';
-    }
-  };
+async function submodDiff(github, core, prNumber, owner, repo, isMergeIntoDefaultBranch) {
+  // Get the changed submodules
+  const { changed_submodules, changed_files, base_ref, pr_ref } = await getChangedSubmodules(github, core, prNumber, owner, repo);
 
-  // Store original branch to return to it later
-  const originalBranch = run('git rev-parse --abbrev-ref HEAD');
-  core.info(`Current branch: ${originalBranch}`);
-  
-  // Initialize results
-  const result = {
-    updatedSubmodules: [],
-    noChanges: [],
-    errors: [],
-    status: 'success'
-  };
-  
-  try {
-    // Make sure we have the latest from remote
-    core.info('Fetching latest from remote...');
-    run(`git fetch ${remote}`);
-    
-    // Process each submodule
-    for (const submodule of submodules) {
-      const { path, targetBranch } = submodule;
-      
-      if (!path || !targetBranch) {
-        core.warning(`⚠️ Skipping submodule with missing path or targetBranch: ${JSON.stringify(submodule)}`);
-        result.errors.push(`Invalid submodule config: ${JSON.stringify(submodule)}`);
-        continue;
-      }
-      
-      core.info(`Processing submodule: ${path} (target branch: ${targetBranch})`);
-      
-      try {
-        // Enter the submodule directory
-        core.info(`Entering submodule directory: ${path}`);
-        const cwd = process.cwd();
-        process.chdir(path);
-        
-        // Fetch the latest from remote for the target branch
-        core.info(`Fetching latest for ${targetBranch}...`);
-        run(`git fetch ${remote} ${targetBranch}`);
-        
-        // Get current commit
-        const currentCommit = run('git rev-parse HEAD');
-        core.info(`Current commit: ${currentCommit.substring(0, 8)}`);
-        
-        // Get latest commit on target branch
-        const latestCommit = run(`git rev-parse ${remote}/${targetBranch}`);
-        core.info(`Latest commit on ${targetBranch}: ${latestCommit.substring(0, 8)}`);
-        
-        // Check if we need to update
-        if (currentCommit !== latestCommit) {
-          core.info(`Updating submodule ${path} to latest on ${targetBranch}...`);
-          
-          // Checkout the target branch
-          run(`git checkout ${targetBranch}`);
-          
-          // Pull the latest changes
-          run(`git pull ${remote} ${targetBranch}`);
-          
-          // Go back to parent repo directory
-          process.chdir(cwd);
-          
-          // Stage the submodule change
-          run(`git add ${path}`);
-          
-          result.updatedSubmodules.push({
-            path,
-            previousCommit: currentCommit.substring(0, 8),
-            newCommit: latestCommit.substring(0, 8)
-          });
-        } else {
-          core.info(`Submodule ${path} is already at the latest commit on ${targetBranch}`);
-          process.chdir(cwd);
-          result.noChanges.push(path);
-        }
-      } catch (err) {
-        core.warning(`⚠️ Error processing submodule ${path}: ${err.message}`);
-        result.errors.push(`${path}: ${err.message}`);
-        // Make sure we're back in the parent repo directory
-        try {
-          process.chdir(cwd);
-        } catch (e) {
-          // Ignore errors when trying to change back to cwd
-        }
-      }
+  // Enrich submodule information only for submodules present in the changed paths
+  const rawSubmodules = await initSubmodsFromGitModules(github, core, prNumber, owner, repo, base_ref);
+
+  const filteredRawSubmodules = {};
+  const changedPaths = new Set([
+    ...(changed_files || []),
+    ...(changed_submodules || [])
+  ]);
+
+  for (const [name, data] of Object.entries(rawSubmodules)) {
+    if (!data || !data.path) continue;
+
+    const subPath = data.path;
+    // Consider this submodule "changed" if its path or a child path appears in the changed set
+    const isChanged = Array.from(changedPaths).some(p => p === subPath || p.startsWith(`${subPath}/`));
+
+    if (isChanged) {
+      filteredRawSubmodules[name] = data;
     }
-    
-    // Commit changes if any submodules were updated
-    if (result.updatedSubmodules.length > 0) {
-      core.info('Committing submodule updates...');
-      const message = commitMessage || `Update submodules to latest on their target branches\n\nUpdated: ${result.updatedSubmodules.map(s => s.path).join(', ')}`;
-      run(`git commit -m "${message}"`);
-      
-      // Push changes if requested
-      if (pushChanges) {
-        core.info('Pushing submodule updates to remote...');
-        run(`git push ${remote} ${originalBranch}`);
-      }
-      
-      core.info('Submodule updates committed successfully.');
-    } else {
-      core.info('No submodule updates to commit.');
-    }
-    
-    // Return to original branch if we're not already on it
-    const currentBranch = run('git rev-parse --abbrev-ref HEAD');
-    if (currentBranch !== originalBranch) {
-      core.info(`Returning to original branch: ${originalBranch}`);
-      run(`git checkout ${originalBranch}`);
-    }
-    
-  } catch (error) {
-    core.error(`Error in git bump submodules: ${error.message}`);
-    result.status = 'failed';
-    result.errors.push(error.message);
   }
+
+  const enrichedSubmodules = await enrichSubmodules(github, core, owner, repo, filteredRawSubmodules, base_ref, pr_ref, isMergeIntoDefaultBranch);
   
-  return result;
+  return {
+    changed_submodules,
+    enriched_submodules: enrichedSubmodules
+  };
+}
+
+/**
+ * Updates a GitHub comment by appending a message to it
+ * @param {object} github - The GitHub API client
+ * @param {number} commentId - The comment ID to update
+ * @param {string} owner - The organization name
+ * @param {string} repo - The repository name
+ * @param {string} appendMsg - The message to append to the comment
+ * @returns {void}
+ */
+async function appendComment(github, commentId, owner, repo, appendMsg) {
+  // Get the existing comment
+  const { data: comment } = await github.rest.issues.getComment({
+    owner: owner,
+    repo: repo,
+    comment_id: commentId,
+  });
+
+  // Append the new message
+  const newBody = comment.body + appendMsg;
+  
+  // Update the comment
+  await github.rest.issues.updateComment({
+    owner: owner,
+    repo: repo,
+    comment_id: commentId,
+    body: newBody,
+  });
 }
 
 // Export the functions
 module.exports = {
-  apiSquashPR,
-  apiRebasePR,
-  apiCherryPickPR,
   localGitMergePipeline, 
-  localGitBumpSubmodules, 
+  checkPrApprovals, 
+  initSubmodsFromGitModules,
+  getChangedSubmodules,
+  getConflictedFiles,
+  submodDiff,
+  deriveRepoNameFromUrl, 
+  computeBaseBranch, 
+  shaInBranch, 
+  findBranchesForHeadCommit, 
+  findPRsForCommit, 
+  determinePRBranchAndNumber,
+  enrichSubmodules, 
+  appendComment,
 };

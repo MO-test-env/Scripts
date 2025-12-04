@@ -39,12 +39,24 @@ env:
 
 jobs:
   link-submods:
-    runs-on: ubuntu-latest
-    timeout-minutes: 3
+    runs-on: isg-ocp-x86-small
+    timeout-minutes: 10
     steps:
+      - name: Checkout utils repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          repository: MO-test-env/orgScripts
+          ref: main
+          path: utils
+          sparse-checkout: scripts/pr-utils.js
+          sparse-checkout-cone-mode: false
+          token: ${{ env.RW_PAT }}
+
       - name: Comment start
         uses: actions/github-script@v7
         with:
+          github-token: ${{ env.RW_PAT }}
           script: |
             const commentId = process.env.COMMENT_ID;
             const owner = process.env.OWNER;
@@ -53,12 +65,13 @@ jobs:
             let appendMsg = "\n# 🔗 Submodule Link Workflow\n";
             appendMsg += `[🖥️ View workflow](${runUrl})\n`;
             appendMsg += "**_(Step 1/2)_** Fetching PR details and submodule info...";
-            await github.rest.issues.updateComment({ owner, repo, comment_id: commentId, body: appendMsg, });
+            await github.rest.issues.updateComment({ owner, repo, comment_id: commentId,body: appendMsg, });
 
       - name: Get BasePR details
         id: pr
         uses: actions/github-script@v7
         with:
+          github-token: ${{ env.RW_PAT }}
           script: |
             const prNumber = process.env.BASE_PR_NUMBER;
             const pr = await github.rest.pulls.get({
@@ -100,341 +113,92 @@ jobs:
             core.info(`Assignees: ${JSON.stringify(assignees)}`);
 
       - name: Determine changed submodules from PR diff
-        id: changed-submodules
+        id: diff-submodules
         uses: actions/github-script@v7
+        env:
+          BASE_REF: ${{ steps.pr.outputs.base_ref }}
+          PR_REF: ${{ steps.pr.outputs.head_ref }}
+          IS_MERGE_INTO_DEFAULT_BRANCH: ${{ steps.pr.outputs.isMergeIntoDefaultBranch }}
         with:
+          github-token: ${{ env.RW_PAT }}
           script: |
             const prNumber = process.env.BASE_PR_NUMBER;
+            const prUtils = require('./utils/scripts/pr-utils.js');
+            let result = {};
+            
+            try {
+              result = await prUtils.getChangedSubmodules(
+                github, 
+                core, 
+                prNumber, 
+                process.env.OWNER, 
+                process.env.REPO
+              );
+            } catch (error) {
+              core.setFailed(`Failed to determine changed submodules: ${error.message}`);
+              core.setOutput("failMsg", `Workflow stopped because failed to determine changed submodules: ${error.message}`);
+              return;
+            }
 
-            // Get file list from GitHub PR diff
-            const { data: files } = await github.rest.pulls.listFiles({
-              owner: process.env.OWNER,
-              repo: process.env.REPO,
-              pull_number: prNumber,
-              per_page: 300
-            });
-
-            // Any file that is a submodule appears with `status = modified` and `patch = null`
-            // and type "submodule" in getContent (later)
-            const changedSubmodulePaths = files
-              .filter(f => f.filename && f.status !== "removed")
-              .map(f => f.filename.split("/")[0]); // top-level folder of filename
-
-            const unique = [...new Set(changedSubmodulePaths)];
-
-            core.info(`Changed top-level paths from PR: ${JSON.stringify(unique)}`);
-            core.setOutput("changed_paths", JSON.stringify(unique));
+            const isMergeIntoDefaultBranch = process.env.IS_MERGE_INTO_DEFAULT_BRANCH === 'true';
+            
+            try {
+              result = await prUtils.submodDiff(
+                github, 
+                core, 
+                prNumber, 
+                process.env.OWNER, 
+                process.env.REPO,
+                isMergeIntoDefaultBranch
+              );
+            } catch (error) {
+              core.warning(`Failed to get submodule diff: ${error.message}`);              
+            }
+            
+            core.setOutput("changed_paths", JSON.stringify(result.changed_submodules));
+            core.setOutput("conflicted_non_submodule_files", JSON.stringify(result.files_with_conflicts));
+            core.setOutput("enriched_submodules", JSON.stringify(result.enriched_submodules));
 
       - name: Parse .gitmodules
         id: parse-gitmodules
         uses: actions/github-script@v7
         env:
           BASE_REF: ${{ steps.pr.outputs.base_ref }}
-          CHANGED_PATHS: ${{ steps.changed-submodules.outputs.changed_paths }}
+          CHANGED_PATHS: ${{ steps.diff-submodules.outputs.changed_paths }}
         with:
+          github-token: ${{ env.RW_PAT }}
           script: |
             const owner = process.env.OWNER;
             const repo = process.env.REPO;
             const baseRef = process.env.BASE_REF;
             const changedPaths = JSON.parse(process.env.CHANGED_PATHS || "[]");
-
-            // Load .gitmodules
-            let content = "";
-            try {
-              const { data: f } = await github.rest.repos.getContent({
-                owner,
-                repo,
-                path: ".gitmodules",
-                ref: baseRef
-              });
-
-              content = Buffer.from(f.content, "base64").toString("utf8");
-            } catch (err) {
-              core.setFailed("Failed to load .gitmodules: " + err.message);
-              return;
-            }
-
-            const lines = content.split("\n");
-            const rawSubmodules = {};
-            let current = null;
-
-            for (const line of lines) {
-              const sub = line.match(/\[submodule \"(.*)\"\]/);
-              const path = line.match(/\s*path = (.*)/);
-              const url = line.match(/\s*url = (.*)/);
-              const br = line.match(/\s*branch = (.*)/);
-
-              if (sub) {
-                current = sub[1];
-                rawSubmodules[current] = {};
-              } else if (current && path) {
-                rawSubmodules[current].path = path[1].trim();
-              } else if (current && url) {
-                rawSubmodules[current].url = url[1].trim();
-              } else if (current && br) {
-                rawSubmodules[current].configuredBranch = br[1].trim();
-              }
-            }
-
-            // Filter submodules: only ones whose top-level folder changed in PR
-            for (const name of Object.keys(rawSubmodules)) {
-              const p = rawSubmodules[name].path;
-              const top = p.split("/")[0];
-              if (!changedPaths.includes(top)) {
-                delete rawSubmodules[name];
-              }
-            }
-
-            core.info("Filtered raw submodules:");
-            core.info(JSON.stringify(rawSubmodules, null, 2));
-            core.setOutput("raw_submodules", JSON.stringify(rawSubmodules));
-
-      - name: Enrich submodules (default branches, repoName, baseBranch)
-        id: enrich-gitmodules
-        uses: actions/github-script@v7
-        env:
-          RAW_SUBMODULES: ${{ steps.parse-gitmodules.outputs.raw_submodules }}
-          BASE_REF: ${{ steps.pr.outputs.base_ref }}
-          IS_MERGE_INTO_DEFAULT_BRANCH: ${{ steps.pr.outputs.isMergeIntoDefaultBranch }}
-        with:
-          script: |
-            const raw = JSON.parse(process.env.RAW_SUBMODULES || "{}");
-            const baseRef = process.env.BASE_REF;
-            const owner = process.env.OWNER;
-
-            const enriched = {};
-
-            for (const [name, data] of Object.entries(raw)) {
-              const { path, url, configuredBranch } = data;
-
-              if (!path || !url) continue;
-
-              //  derive repoName from URL 
-              let repoName = null;
-
-              if (url.startsWith("https://github.com/")) {
-                repoName = url.replace("https://github.com/", "")
-                              .replace(".git", "")
-                              .split("/")[1];
-              } else if (url.startsWith("git@github.com:")) {
-                repoName = url.replace("git@github.com:", "")
-                              .replace(".git", "")
-                              .split("/")[1];
-              } else if (url.startsWith("../")) {
-                repoName = url.replace("../", "").replace(".git", "");
-              } else {
-                repoName = url.split(/[\/:]/).pop().replace(".git", "");
-              }
-
-              core.info(`Submodule ${name} resolves repoName: ${repoName}`);
-
-              //  load default branch 
-              let subDefaultBranch = null;
-              try {
-                const { data: repoInfo } = await github.rest.repos.get({
-                  owner,
-                  repo: repoName
-                });
-                subDefaultBranch = repoInfo.default_branch;
-              } catch (err) {
-                core.warning(`Failed repo lookup for ${repoName}: ${err.message}`);
-                continue;
-              }
-
-              //  compute baseBranch 
-              let baseBranch;
-            if (process.env.IS_MERGE_INTO_DEFAULT_BRANCH === 'true')  {
-              baseBranch = subDefaultBranch;
-              core.info(`Using default branch '${baseBranch}' for submodule ${name}`);
-            } else {
-              baseBranch = baseRef;
-              core.info(`Using PR base_ref '${baseBranch}' for submodule ${name}`);
-            }
-
-            enriched[name] = {
-              path,
-              url,
-              repoName,
-              configuredBranch,
-              subDefaultBranch,
-              baseBranch
-            };
+            const prUtils = require('./utils/scripts/pr-utils.js');
             
-            core.info("Enriched submodules:");
-            core.info(JSON.stringify(enriched, null, 2));
-            core.setOutput("git_modules", JSON.stringify(enriched));
-      
-      - name: Update submodules with SHA, PR branch, and PR number
-        id: diff-getprbr-getprnum
-        uses: actions/github-script@v7
-        env:
-          GIT_MODULES: ${{ steps.enrich-gitmodules.outputs.git_modules }}
-          PR_BRANCH: ${{ steps.pr.outputs.head_ref }}
-          BASE_REF: ${{ steps.pr.outputs.base_ref }}
-        with:
-          script: |
-            const gitModules = JSON.parse(process.env.GIT_MODULES || "{}");
-            const submod_with_pr_branches = {};
-
-            if (Object.keys(gitModules).length === 0) {
-              core.info("No changed submodules to process.");
-              core.setOutput("submod_with_pr_branches", "{}");
+            let rawSubmodules = {};
+            
+            try {
+              rawSubmodules = await prUtils.initSubmodsFromGitModules(
+                github, 
+                core, 
+                0, // prNumber not used in this function
+                owner, 
+                repo, 
+                baseRef, 
+                changedPaths
+              );
+            } catch (error) {
+              core.setFailed(`Failed to parse .gitmodules: ${error.message}`);
+              core.setOutput("failMsg", `Workflow stopped because failed to parse .gitmodules: ${error.message}`);
               return;
             }
-
-            // Helper: check if sha is anywhere on a branch (not only HEAD)
-            async function shaInBranch(owner, repo, branch, sha) {
-              try {
-                const { data: commits } = await github.rest.repos.listCommits({
-                  owner,
-                  repo,
-                  sha: branch,
-                  per_page: 100
-                });
-                return commits.some(c => c.sha === sha);
-              } catch (err) {
-                return false;
-              }
-            }
-
-            for (const [submodule, submoduleData] of Object.entries(gitModules)) {
-              try {
-                // Get the SHA of the submodule from the PR branch
-                const { data: prContent } = await github.rest.repos.getContent({
-                  owner: process.env.OWNER,
-                  repo: process.env.REPO,
-                  path: submoduleData.path,
-                  ref: process.env.PR_BRANCH
-                });
-
-                if (!prContent || prContent.type !== "submodule") {
-                  // Not submodule change so ignore
-                  continue;
-                }
-
-                const sha = prContent.sha;
-                const repoName = submoduleData.repoName || submoduleData.url.split('/').pop().replace('.git','');
-                const submodBaseBranch = submoduleData.baseBranch;
-
-                let branchesContainingSha = [];
-                let prBranch = null;
-                let prNumber = null;
-
-                // Try to find branches where the SHA is at the head. This is very important to help create the PRs 
-                try {
-                  const { data: branches } = await github.rest.repos.listBranchesForHeadCommit({
-                    owner: process.env.OWNER,
-                    repo: repoName,
-                    commit_sha: sha
-                  });
-                  branchesContainingSha = branches.map(b => b.name);
-                } catch (err) {
-                  core.warning(`Could not list branches for head commit ${sha}: ${err.message}`);
-                }
-
-                // Check if SHA is on the default branch (like if delivered or reverted)
-                let isShaOnBaseBranch = false;
-                if (submodBaseBranch) {
-                  isShaOnBaseBranch = await shaInBranch(process.env.OWNER, repoName, submodBaseBranch, sha);
-                }
-
-                // Find all PRs associated with the commit
-                let prs = [];
-                try {
-                  const { data: prList } =
-                    await github.rest.repos.listPullRequestsAssociatedWithCommit({
-                      owner: process.env.OWNER,
-                      repo: repoName,
-                      commit_sha: sha
-                    });
-                  prs = prList;
-                } catch (err) {
-                  core.warning(`Unable to find PRs associated with ${sha}: ${err.message}`);
-                }
-
-                const openPRs = prs.filter(pr => pr.state === "open");
-                const mergedPRs = prs.filter(pr => pr.merged_at);
-
-                // SHA on delivery branch 
-                if (isShaOnBaseBranch) {
-                  prBranch = submodBaseBranch;
-                  prNumber = 0;
-                }
-
-                // SHA has exactly one open PR
-                else if (openPRs.length === 1) {
-                  const prObj = openPRs[0];
-                  prBranch = prObj.head.ref;
-                  prNumber = prObj.number;
-
-                  // warning if head-of-branch contradicts PR branch
-                  if (branchesContainingSha.length === 1 && branchesContainingSha[0] !== prBranch) {
-                    core.warning(
-                      `SHA ${sha} is HEAD of '${branchesContainingSha[0]}' but open PR uses branch '${prBranch}'.`
-                    );
-                  }
-                }
-
-                // SHA has merged PR(s)
-                else if (mergedPRs.length >= 1) {
-                  const latest = mergedPRs.sort(
-                    (a, b) => new Date(b.merged_at) - new Date(a.merged_at)
-                  )[0];
-
-                  prBranch = latest.head.ref;
-                  prNumber = latest.number;
-                }
-
-                // SHA is HEAD of exactly one branch → no PR yet
-                else if (branchesContainingSha.length === 1) {
-                  prBranch = branchesContainingSha[0];
-                  prNumber = -1;
-                }
-
-                // SHA is HEAD of multiple branches → ambiguous
-                else if (branchesContainingSha.length > 1) {
-                  core.setFailed(
-                    `SHA ${sha} is HEAD of multiple branches (${branchesContainingSha}) and has no PR.`
-                  );
-                  return;
-                }
-
-                // No PRs, not on head, not on base branch → fail
-                else {
-                  core.setFailed(
-                    `Could not determine PR or branch for SHA ${sha}. Not on default branch, not head of branch, no PRs.`
-                  );
-                  return;
-                }
-
-                // Save result
-                submodulesWithPrBranches[submodule] = {
-                  ...submoduleData,
-                  sha,
-                  prBranch,
-                  prNumber
-                };
-
-                core.info(`Resolved ${submodule}: sha=${sha}, branch=${prBranch}, prNumber=${prNumber}`);
-
-              } catch (err) {
-                core.setFailed(`Error processing submodule ${submodule}: ${err.message}`);
-                return;
-              }
-            }
-
-            const submodulesWithPrBranchesJSON = JSON.stringify(submodulesWithPrBranches, null, 2);
-            core.info("Added sha, PR branch, and PR number:");
-            core.info(submodulesWithPrBranchesJSON);
-
-            core.setOutput('submod_with_pr_branches', submodulesWithPrBranchesJSON);
-
+            
+            core.setOutput("raw_submodules", JSON.stringify(rawSubmodules));
 
       - name: Pre-check all Submodules and add additional submodule fields 
         id: pre-check-submod
         uses: actions/github-script@v7
         env:
-          SUBMODULES_JSON: ${{ steps.diff-getprbr-getprnum.outputs.submod_with_pr_branches }}
+          SUBMODULES_JSON: ${{ steps.diff-submodules.outputs.enriched_submodules }}
           PR_BRANCH: ${{ steps.pr.outputs.head_ref }}
           BASE_BRANCH: ${{ steps.pr.outputs.base_ref }}
         with:
@@ -518,19 +282,24 @@ jobs:
                       }
 
                       // Check approvals 
-                      const { data: reviews } = await github.rest.pulls.listReviews({
-                        owner: process.env.OWNER,
-                        repo: sub.repoName,
-                        pull_number: prNumber,
-                      });
+                      const prUtils = require('./utils/scripts/pr-utils.js');
+                      let approvalCount = 0;
+                      let changeRequestCount = 0;
                       
-                      const latestByUser = {};
-                      for (const review of reviews) {
-                        latestByUser[review.user.login] = review.state;
+                      try {
+                        const result = await prUtils.checkPrApprovals(
+                          github, 
+                          core, 
+                          prNumber, 
+                          process.env.OWNER, 
+                          sub.repoName
+                        );
+                        approvalCount = result.approvalCount;
+                        changeRequestCount = result.changeRequestCount;
+                      } catch (error) {
+                        core.warning(`Error checking approvals for submodule ${name}: ${error.message}`);
+                        // Continue with default values rather than failing the entire workflow
                       }
-                      const approvedUsers = Object.values(latestByUser).filter(s => s === 'APPROVED');
-                      const approvalCount = approvedUsers.length;
-                      const changeRequestCount = Object.values(latestByUser).filter(s => s === 'CHANGES_REQUESTED').length;
                       const prState = prInfo.number === 0 ? null : prInfo.merged_at ? 'merged' : prInfo.state === 'closed' ? 'closed' : 'open';
                       
                       // Push full object 
@@ -567,7 +336,7 @@ jobs:
             core.setOutput('unmerged', unmergedJson);
             
 
-            // Simple validation: ensure the number of submodules from the diff step matches the number in the pre-check step
+            // addl validation: ensure the number of submodules from the diff step matches the number in the pre-check step
             const submodulesFromDiff = JSON.parse(process.env.SUBMODULES_JSON);
             const diffSubmoduleCount = Object.keys(submodulesFromDiff).length;
             const precheckSubmoduleCount = submodulesArray.length;
@@ -608,15 +377,39 @@ jobs:
               if (submodule.isPRCreated && submodule.prState === 'open' && submodule.prNumber) {
 
                 try {
-                  // Add reviewers if there are any
-                  if (reviewers.length > 0 || teamReviewers.length > 0) {
-                    await github.rest.pulls.requestReviewers({
+                  // Add reviewers if there are any and the submodule doesn't already have enough approvals
+                  if ((reviewers.length > 0 || teamReviewers.length > 0) && 
+                      (submodule.approvals < parseInt(process.env.MIN_REVIEWERS) || submodule.changeRequests > 0)) {
+                    // Get current reviewers for the PR to avoid re-requesting from people already on the approvals list
+                    const currentReviewers = await github.rest.pulls.listReviews({
                       owner: process.env.OWNER,
                       repo: submodule.repoName,
                       pull_number: submodule.prNumber,
-                      reviewers: reviewers,
-                      team_reviewers: teamReviewers
+                      per_page: 100
                     });
+                    
+                    // Extract usernames of reviewers who have already approved
+                    const approvedReviewers = currentReviewers.data
+                      .filter(review => review.state === 'APPROVED')
+                      .map(review => review.user.login);
+                    
+                    // Filter out reviewers who have already approved
+                    const newReviewers = reviewers.filter(reviewer => !approvedReviewers.includes(reviewer));
+                    const newTeamReviewers = teamReviewers; // Teams are handled differently, keep as is
+                    
+                    // Only request reviews if there are new reviewers to add
+                    if (newReviewers.length > 0 || newTeamReviewers.length > 0) {
+                      await github.rest.pulls.requestReviewers({
+                        owner: process.env.OWNER,
+                        repo: submodule.repoName,
+                        pull_number: submodule.prNumber,
+                        reviewers: newReviewers,
+                        team_reviewers: newTeamReviewers
+                      });
+                      core.info(`Added reviewers to PR #${submodule.pr_number} for ${submodule.repoName}`);
+                    } else {
+                      core.info(`All reviewers already approved PR #${submodule.pr_number} for ${submodule.repoName}, skipping review request`);
+                    }
                   }
                   
                   // Add assignees if there are any
@@ -718,14 +511,13 @@ jobs:
           TEAM_REVIEWERS: ${{ steps.pr.outputs.team_reviewers }}
           ASSIGNEES: ${{ steps.pr.outputs.assignees }}
         with:
+          github-token: ${{ env.RW_PAT }}
           script: |
             const commentId = process.env.COMMENT_ID;
             const owner = process.env.OWNER;
             const repo = process.env.REPO;
             const submodulesAfterPrecheck = JSON.parse(process.env.SUBMODULES_JSON);
             const prsWithReviewers = JSON.parse(process.env.PRS_WITH_REVIEWERS || '[]');
-            
-            const { data: comment } = await github.rest.issues.getComment({ owner, repo, comment_id: commentId, });
             
             function getStatusIcon(sub) {
               if (!sub.prBranch) return '❌';
@@ -816,27 +608,27 @@ jobs:
             
             appendMsg += "\n Workflow complete ";
             
-            const newBody = comment.body + appendMsg;
-            await github.rest.issues.updateComment({ owner, repo, comment_id: commentId, body: newBody, });
+            const prUtils = require('./utils/scripts/pr-utils.js');
+            await prUtils.appendComment(github, commentId, owner, repo, appendMsg);
 
       - name: Comment on Failure
         if: ${{ failure() }}
         uses: actions/github-script@v7
         env:
           JOB_NAME: ${{ github.job }}
-          FAIL_MSG_DIFF_SUBMODULES: ${{ steps.diff-getprbr-getprnum.outputs.failMsg }}
+          FAIL_MSG_DIFF_SUBMODULES: ${{ steps.diff-submodules.outputs.failMsg }}
           FAIL_MSG_PRE_CHECK_SUBMOD: ${{ steps.pre-check-submod.outputs.failMsg }}
         with:
+          github-token: ${{ env.RW_PAT }}
           script: |
             const commentId = process.env.COMMENT_ID;
             const job = process.env.JOB_NAME;
-            const { data: comment } = await github.rest.issues.getComment({ owner: process.env.OWNER, repo: process.env.REPO, comment_id: commentId, });
-            
+
             let failureMsg = "❌ **Job failed:** ";
             let appendMsg = "";
             let resolutionSteps = "";
             
-            if ('${{ steps.diff-getprbr-getprnum.conclusion }}' == 'failure'){
+            if ('${{ steps.diff-submodules.conclusion }}' == 'failure'){
               appendMsg = "Failed to parse submodule diff, get submodule PR branches, or submodule PR numbers." + (process.env.FAIL_MSG_DIFF_SUBMODULES || "");
               resolutionSteps = "_Please ensure you have pushed up your branches or ensure that the base sha is pointing to the right place._";
             } else if ('${{ steps.pre-check-submod.conclusion }}' == 'failure'){
@@ -851,5 +643,6 @@ jobs:
               resolutionSteps = "_Please try again later._";
             }
             
-            const newBody = comment.body + "\n\n" + failureMsg + appendMsg + "\n" + resolutionSteps;
-            await github.rest.issues.updateComment({ owner: process.env.OWNER, repo: process.env.REPO, comment_id: commentId, body: newBody, });
+            const newBody = "\n\n"+ failureMsg + appendMsg + "\n" + resolutionSteps;
+            const prUtils = require('./utils/scripts/pr-utils.js');
+            await prUtils.appendComment(github, commentId, process.env.OWNER, process.env.REPO, newBody);
